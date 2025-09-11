@@ -18,17 +18,17 @@ void rmsnorm(float o[S], float x[S], float weight[S])
   float x_buff[S];
   float weight_buff[S];
   float out_buff[S];
-#pragma HLS array_partition variable = x_buff type = cyclic factor = 128
-#pragma HLS array_partition variable = weight_buff type = cyclic factor = 64
-#pragma HLS array_partition variable = out_buff type = cyclic factor = 64
+//#pragma HLS array_partition variable = x_buff type = cyclic factor = 128
+//#pragma HLS array_partition variable = weight_buff type = cyclic factor = 64
+//#pragma HLS array_partition variable = out_buff type = cyclic factor = 64
   std::memcpy(x_buff, x, array_size);
   std::memcpy(weight_buff, weight, array_size);
 
 sum_of_squares:
   for (int j = 0; j < S; j++)
   {
-#pragma HLS PIPELINE
-#pragma HLS UNROLL factor = 128 skip_exit_check
+//#pragma HLS PIPELINE
+//#pragma HLS UNROLL factor = 128 skip_exit_check
     float x_j = x_buff[j];
     ss += x_j * x_j;
   }
@@ -39,8 +39,8 @@ sum_of_squares:
 norm_and_scale:
   for (int j = 0; j < S; j++)
   {
-#pragma HLS PIPELINE
-#pragma HLS UNROLL factor = 64
+//#pragma HLS PIPELINE
+//#pragma HLS UNROLL factor = 64
     float weight_j = weight_buff[j];
     float x_j = x_buff[j];
     out_buff[j] = weight_j * (ss * x_j);
@@ -57,8 +57,8 @@ void softmax(float *x, int size)
 max:
   for (int i = 1; i < size; i++)
   {
-#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
-#pragma HLS PIPELINE
+//#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
+//#pragma HLS PIPELINE
     float x_i = x[i];
     if (x_i > max_val)
     {
@@ -70,9 +70,9 @@ max:
 exp:
   for (int i = 0; i < size; i++)
   {
-#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
-#pragma HLS PIPELINE
-#pragma HLS UNROLL factor = 16
+//#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
+//#pragma HLS PIPELINE
+//#pragma HLS UNROLL factor = 16
     float x_i = expf(x[i] - max_val);
     buffer[i] = x_i;
   }
@@ -80,7 +80,7 @@ exp:
 sum:
   for (int i = 0; i < size; i++)
   {
-#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
+//#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
     sum += buffer[i];
   }
   // normalize
@@ -88,9 +88,9 @@ sum:
 norm:
   for (int i = 0; i < size; i++)
   {
-#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
-#pragma HLS PIPELINE
-#pragma HLS UNROLL factor = 16
+//#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
+//#pragma HLS PIPELINE
+//#pragma HLS UNROLL factor = 16
     x[i] = buffer[i] * inv_sum;
   }
 }
@@ -114,42 +114,42 @@ void matmul_old(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
   int8_t w_buffer[N * D];
   float ws_buffer[N * D / GS];
 
-#pragma HLS ARRAY_PARTITION variable = x_buffer type = cyclic factor = 16
-#pragma HLS ARRAY_PARTITION variable = xs_buffer type = cyclic factor = 4
-#pragma HLS ARRAY_PARTITION variable = w_buffer type = cyclic factor = 128
-#pragma HLS ARRAY_PARTITION variable = ws_buffer type = cyclic factor = 32
+// #pragma HLS ARRAY_PARTITION variable = x_buffer type = cyclic factor = 16
+// #pragma HLS ARRAY_PARTITION variable = xs_buffer type = cyclic factor = 4
+// #pragma HLS ARRAY_PARTITION variable = w_buffer type = cyclic factor = 128
+// #pragma HLS ARRAY_PARTITION variable = ws_buffer type = cyclic factor = 32
 //
 x_buff:
   for (int i = 0; i < N; i++)
   {
-#pragma HLS UNROLL factor = 16
+// #pragma HLS UNROLL factor = 16
     x_buffer[i] = xq[i];
   }
 xs_buff:
   for (int j = 0; j <= N - GS; j += GS)
   {
-#pragma HLS UNROLL factor = 4
+// #pragma HLS UNROLL factor = 4
     xs_buffer[j / GS] = xs[j / GS];
   }
 
 w_buff:
   for (int i = 0; i < N * D; i++)
   {
-#pragma HLS UNROLL factor = 128
+// #pragma HLS UNROLL factor = 128
     w_buffer[i] = wq[i];
   }
 
 ws_buff:
   for (int i = 0; i < N * D / GS; i++)
   {
-#pragma HLS UNROLL factor = 32
+// #pragma HLS UNROLL factor = 32
     ws_buffer[i] = ws[i];
   }
 
   int i;
   for (i = 0; i < D; i++)
   {
-#pragma HLS PIPEPLINE
+// #pragma HLS PIPEPLINE
     float val = 0.0f;
     // start index of row i
     const int in = i * N;
@@ -174,12 +174,12 @@ ws_buff:
   matmul3:
     for (j = 0; j <= N - GS; j += GS)
     {
-#pragma HLS UNROLL
+// #pragma HLS UNROLL
       int32_t ival = 0;
     matmul4:
       for (int k = 0; k < GS; k++)
       {
-#pragma HLS UNROLL
+// #pragma HLS UNROLL
         ival += ((int32_t)x_buffer[j + k]) * ((int32_t)w_buffer[in + j + k]);
       }
       val += ((float)ival) * ws_buffer[in_s + j / GS] * xs_buffer[j / GS];
@@ -205,31 +205,31 @@ void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
   static float xs_buffer[N / GS];
   // float out_buffer[D];
 
-#pragma HLS ARRAY_PARTITION variable = x_buffer type = cyclic factor = 16
-#pragma HLS ARRAY_PARTITION variable = xs_buffer type = cyclic factor = 4
+// #pragma HLS ARRAY_PARTITION variable = x_buffer type = cyclic factor = 16
+// #pragma HLS ARRAY_PARTITION variable = xs_buffer type = cyclic factor = 4
 //
 x_buff:
   for (int i = 0; i < N; i++)
   {
-#pragma HLS UNROLL factor = 16
+// #pragma HLS UNROLL factor = 16
     x_buffer[i] = xq[i];
   }
 xs_buff:
   for (int j = 0; j <= N - GS; j += GS)
   {
-#pragma HLS UNROLL factor = 4
+// #pragma HLS UNROLL factor = 4
     xs_buffer[j / GS] = xs[j / GS];
   }
 
   int i;
   for (i = 0; i < D; i++)
   {
-#pragma HLS PIPELINE
+// #pragma HLS PIPELINE
     float val = 0.0f;
     int8_t w_buffer[N];
     float ws_buffer[N / GS];
-#pragma HLS ARRAY_PARTITION variable = w_buffer type = cyclic factor = 32
-#pragma HLS ARRAY_PARTITION variable = ws_buffer type = cyclic factor = 32
+// #pragma HLS ARRAY_PARTITION variable = w_buffer type = cyclic factor = 32
+// #pragma HLS ARRAY_PARTITION variable = ws_buffer type = cyclic factor = 32
     // start index of row i
     const int in = i * N;
   matmul1:
@@ -285,19 +285,19 @@ extern "C" void forward(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_hea
   static float k[(config.dim * config.n_kv_heads) / config.n_heads]; // key (dim,)
   static float v[(config.dim * config.n_kv_heads) / config.n_heads]; // value (dim,)
   static float att[config.n_heads * config.seq_len];                 // buffer for scores/attention values (n_heads, seq_len)
-#pragma HLS ARRAY_PARTITION variable = q cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = k cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = v cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = att cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = hq.q cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = hq.s cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = xq.q cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = xq.s cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = hb type = cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = hb2 type = cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = x type = cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = xb type = cyclic factor = UNROLL_FACTOR
-#pragma HLS ARRAY_PARTITION variable = xb2 type = cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = q cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = k cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = v cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = att cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = hq.q cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = hq.s cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = xq.q cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = xq.s cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = hb type = cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = hb2 type = cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = x type = cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = xb type = cyclic factor = UNROLL_FACTOR
+// #pragma HLS ARRAY_PARTITION variable = xb2 type = cyclic factor = UNROLL_FACTOR
   constexpr int kv_dim = (config.dim * config.n_kv_heads) / config.n_heads;
   constexpr int kv_mul = config.n_heads / config.n_kv_heads; // integer multiplier of the kv sharing in multiquery
   constexpr int head_size = dim / config.n_heads;
@@ -324,8 +324,8 @@ main_forward_loop:
     // Rotation for both query and key vectors (i < kv_dim)
     for (int i = 0; i < kv_dim; i += 2)
     {
-#pragma HLS UNROLL factor = UNROLL_FACTOR
-#pragma HLS PIPELINE
+// #pragma HLS UNROLL factor = UNROLL_FACTOR
+// #pragma HLS PIPELINE
       int head_dim = i % head_size;
       float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
       float val = pos * freq;
@@ -348,7 +348,7 @@ main_forward_loop:
     // Rotation for only the query vector (i >= kv_dim)
     for (int i = kv_dim; i < dim; i += 2)
     {
-#pragma HLS PIPELINE
+// #pragma HLS PIPELINE
       int head_dim = i % head_size;
       float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
       float val = pos * freq;
@@ -385,8 +385,8 @@ main_forward_loop:
     iterate:
       for (int t = 0; t <= pos; t++)
       {
-#pragma HLS PIPELINE
-#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
+// #pragma HLS PIPELINE
+// #pragma HLS loop_tripcount min = 0 max = 257 avg = 129
         // get the key vector for this head and at this timestep
         // float *k_t = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
         const int key_offset = loff + t * kv_dim + (h / kv_mul) * head_size;
@@ -394,7 +394,7 @@ main_forward_loop:
         float score = 0.0f;
         for (int i = 0; i < head_size; i++)
         {
-#pragma HLS unroll
+// #pragma HLS unroll
           score += q[i + q_offset] * key_cache[i + key_offset];
         }
         score /= sqrtf(head_size);
@@ -412,8 +412,8 @@ main_forward_loop:
     acc:
       for (int t = 0; t <= pos; t++)
       {
-#pragma HLS loop_tripcount min = 0 max = 257 avg = 129
-#pragma HLS PIPELINE
+// #pragma HLS loop_tripcount min = 0 max = 257 avg = 129
+// #pragma HLS PIPELINE
         // get the value vector for this head and at this timestep
         // float *v_t = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
         // get the attention weight for this timestep
@@ -423,7 +423,7 @@ main_forward_loop:
       acc_inner:
         for (int i = 0; i < head_size; i++)
         {
-#pragma HLS unroll
+// #pragma HLS unroll
           xb[i + xb_offset] += a * value_cache[i + v_offset];
         }
       }
@@ -437,7 +437,7 @@ main_forward_loop:
   residual:
     for (int i = 0; i < dim; i++)
     {
-#pragma HLS UNROLL factor = 64 skip_exit_check
+// #pragma HLS UNROLL factor = 64 skip_exit_check
       x[i] += xb2[i];
     }
 
@@ -450,12 +450,12 @@ main_forward_loop:
     matmul<dim, hidden_dim>(hb, xq.q, xq.s, (w->w1 + l)->q, (w->w1 + l)->s);
     matmul<dim, hidden_dim>(hb2, xq.q, xq.s, (w->w3 + l)->q, (w->w3 + l)->s);
     float hb_out[hidden_dim];
-#pragma HLS array_partition variable = hb_out type = cyclic factor = 16
+// #pragma HLS array_partition variable = hb_out type = cyclic factor = 16
   swi_glu:
     for (int i = 0; i < hidden_dim; i++)
     {
-#pragma HLS UNROLL factor = 4
-#pragma HLS PIPELINE
+// #pragma HLS UNROLL factor = 4
+// #pragma HLS PIPELINE
       float val = hb[i];
       // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
       val *= (1.0f / (1.0f + expf(-val)));
@@ -473,7 +473,7 @@ main_forward_loop:
   residual2:
     for (int i = 0; i < dim; i++)
     {
-#pragma HLS UNROLL factor = 16 skip_exit_check
+// #pragma HLS UNROLL factor = 16 skip_exit_check
       x[i] += xb[i];
     }
   }

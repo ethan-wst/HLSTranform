@@ -20,14 +20,14 @@ void quantize(QuantizedTensor<S> *qx, float x[S], int GS)
   float scale_buffer[num_groups];
   int8_t quantized_buffer[S];
 // #pragma HLS ARRAY_PARTITION variable = x type=cyclic factor = 8
-#pragma HLS ARRAY_PARTITION variable = quantized_buffer type = cyclic factor = 64
-#pragma HLS ARRAY_PARTITION variable = scale_buffer type = cyclic factor = 16
+// #pragma HLS ARRAY_PARTITION variable = quantized_buffer type = cyclic factor = 64
+// #pragma HLS ARRAY_PARTITION variable = scale_buffer type = cyclic factor = 16
 
 main_loop:
   for (int group = 0; group < num_groups; group++)
   {
-#pragma HLS UNROLL factor = 8
-#pragma HLS PIPELINE
+// #pragma HLS UNROLL factor = 8
+// #pragma HLS PIPELINE
     float wmax = 0.0;
     int base_idx = group * GS;
 
@@ -35,7 +35,7 @@ main_loop:
   max:
     for (int i = 0; i < GS; i++)
     {
-#pragma HLS PIPELINE
+// #pragma HLS PIPELINE
       float val = fabs(x[base_idx + i]);
       if (val > wmax)
       {
@@ -51,7 +51,7 @@ main_loop:
     for (int i = 0; i < GS; i++)
     {
 // #pragma HLS UNROLL factor=8 skip_exit_check
-#pragma HLS PIPELINE
+// #pragma HLS PIPELINE
       float quant_value = x[base_idx + i] / scale;   // scale
       int8_t quantized = (int8_t)round(quant_value); // round and clamp
       quantized_buffer[base_idx + i] = quantized;
