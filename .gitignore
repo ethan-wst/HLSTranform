@@ -4,3 +4,5 @@
 *_quantized.txt
 llama_xrt_kernels/llama_xrt_kernels
 llama_xrt_kernels/vitis_hls.log
+
+*.bin
