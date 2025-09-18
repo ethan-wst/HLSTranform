@@ -1,8 +1,9 @@
-.analytics
-.metadata
+# Ignore build artifacts, temp files, and logs
+HLS_link/*
+HLS_synth/*
+.ipcache
 
-*_quantized.txt
-llama_xrt_kernels/llama_xrt_kernels
-llama_xrt_kernels/vitis_hls.log
-
+# Ignore binary files
 *.bin
+*.xclbin
+*.xo

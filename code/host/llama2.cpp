@@ -853,7 +853,7 @@ int main(int argc, char *argv[])
   unsigned long long rng_seed = 0; // seed rng with time by default
   const char *mode = "generate";   // generate|chat
   char *system_prompt = NULL;      // the (optional) system prompt to use in chat mode
-  std::string kernelpath = "";
+  std::string kernelpath = "forward.xclbin";
 
   // poor man's C argparse so we can override the defaults above from the command line
   if (argc >= 2)
