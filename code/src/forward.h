@@ -3,12 +3,11 @@
 #include <ap_int.h>
 #include <hls_stream.h>
 
-// Use the config values to create concrete types
-typedef Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> Transformer;
+//typedef Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> Transformer;
 
 // Forward declaration with concrete types
 extern "C" void forward(
-   Transformer *transformer,
+   Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *transformer,
     int token, 
     int pos, 
     float key_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], 
@@ -37,8 +36,8 @@ void dequantize(QuantizedTensor<S> *qx, float x[S], int GS) {
 
 template<int S>
 void quantize(QuantizedTensor<S> *qx, float x[S], int GS) {
-    constexpr int num_groups = S / GS;      // changed from hard coded 64
-    constexpr float Q_MAX = 127.0f;
+    constexpr int num_groups = S / 64;
+    constexpr float inv_Q_MAX = 1 / 127.0f;
     
     float scale_buffer[num_groups];
     int8_t quantized_buffer[S];
@@ -54,14 +53,15 @@ void quantize(QuantizedTensor<S> *qx, float x[S], int GS) {
             float abs_val = (x[base_idx + i] >= 0) ? x[base_idx + i] : -x[base_idx + i];
             wmax = (abs_val > wmax) ? abs_val : wmax;
         }
-        
-        float scale = wmax / Q_MAX;
+
+        float scale = wmax * inv_Q_MAX;
+        float inv_scale = 1 / scale;
         scale_buffer[group] = scale;
         
         // Quantize values in group
         quantize_group:
         for (int i = 0; i < GS; i++) {
-            float val = x[base_idx + i] / scale;
+            float val = x[base_idx + i] * inv_scale;
             quantized_buffer[base_idx + i] = (int8_t)(val + 0.5f);
         }
     }

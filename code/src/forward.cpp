@@ -2,10 +2,11 @@
 #include "config.h"
 #include <cstring>
 #include <cmath>
+#include <hls_math.h>
 
 // Main forward function with minimal interface pragmas
 extern "C" void forward(
-    Transformer *transformer,
+    Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *transformer,
     int token, 
     int pos, 
     float key_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], 
@@ -40,6 +41,13 @@ extern "C" void forward(
     constexpr int kv_dim = (dim * n_kv_heads) / n_heads;                    // dimension of key/value vectors
     constexpr int kv_mul = n_heads / n_kv_heads;                            // integer multiplier of the kv sharing in multiquery
     constexpr int head_size = dim / n_heads;                                // dimension of each attention head
+
+    // Pre-compute reciprocals for frequent divisions
+    static const float inv_head_size = 1.0f / float(head_size);  // For attention scaling
+    static const float inv_sqrt_head_size = 1.0f / hls::sqrt(float(head_size));  // HLS sqrt
+    constexpr float inv_10000 = 1.0f / 10000.0f;  // For RoPE frequency
+    
+    // Static arrays (unchanged)
     
     // Access transformer weights
     auto w = &transformer->weights;
@@ -65,10 +73,11 @@ extern "C" void forward(
         rotation1:
         for (int i = 0; i < kv_dim; i += 2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            // OPTIMIZED: Use reciprocal multiplication instead of division
+            float freq = hls::pow(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = hls::cos(val);  // HLS optimized cosine
+            float fci = hls::sin(val);  // HLS optimized sine
             
             // Rotate the query vector
             float v0_q = q[i];
@@ -87,10 +96,11 @@ extern "C" void forward(
         // Rotation for only the query vector (i >= kv_dim)
         for (int i = kv_dim; i < dim; i += 2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            // OPTIMIZED: Use reciprocal multiplication instead of division
+            float freq = hls::pow(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = hls::cos(val);  // HLS optimized cosine
+            float fci = hls::sin(val);  // HLS optimized sine
             
             // Rotate only the query vector
             float v0 = q[i];
@@ -126,7 +136,7 @@ extern "C" void forward(
                 for (int i = 0; i < head_size; i++) {
                     score += q[i + q_offset] * key_cache[i + key_offset];
                 }
-                score /= sqrtf(head_size);
+                score *= inv_sqrt_head_size;  // Scale the score
                 
                 // Save the score to the attention buffer
                 att[t + att_offset] = score;
@@ -181,7 +191,8 @@ extern "C" void forward(
         for (int i = 0; i < hidden_dim; i++) {
             float val = hb[i];
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
+            float exp_neg_val = hls::exp(-val);
+            val *= (1.0f / (1.0f + exp_neg_val));  // Reciprocal form of sigmoid
             // elementwise multiply with w3(x)
             val *= hb2[i];
             hb_out[i] = val;
@@ -211,23 +222,27 @@ extern "C" void forward(
 // Implementation of neural network building blocks
 template<int S>
 void rmsnorm(float o[S], float x[S], float weight[S]) {
+    // Pre-computed reciprocal
+    constexpr float inv_S = 1.0f / float(S);  
     // Calculate sum of squares
     float ss = 0.0f;
     
     sum_of_squares:
     for (int j = 0; j < S; j++) {
+        #pragma HLS PIPELINE II=1
         float x_j = x[j];
         ss += x_j * x_j;
     }
-    
-    ss /= S;
+
+    // OPTIMIZED: Use reciprocal multiplication and HLS sqrt
+    ss *= inv_S;  // Instead of ss /= S
     ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
-    
-    // Normalize and scale
+    float inv_sqrt_ss = 1.0f / hls::sqrt(ss);  // HLS sqrt + reciprocal
+
     norm_and_scale:
     for (int j = 0; j < S; j++) {
-        o[j] = weight[j] * (ss * x[j]);
+        #pragma HLS PIPELINE II=1
+        o[j] = weight[j] * (inv_sqrt_ss * x[j]);
     }
 }
 
@@ -249,7 +264,7 @@ void softmax(float *x, int size) {
     
     exp_and_sum:
     for (int i = 0; i < size; i++) {
-        float x_i = expf(x[i] - max_val);
+        float x_i = hls::exp(x[i] - max_val);
         x[i] = x_i;  // Store back directly
         sum += x_i;
     }
