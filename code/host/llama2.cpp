@@ -986,21 +986,7 @@ float evaluate_perplexity_on_file(const char* text_file,
     printf("Lines processed: %d\n", lines_processed);
     printf("Total tokens evaluated: %d\n", eval.total_tokens);
     printf("Average negative log likelihood: %.6f\n", -eval.total_log_prob / eval.total_tokens);
-    printf("Final perplexity: %.3f\n", perplexity);
-    
-    // Sanity check
-    if (perplexity > 1000) {
-        printf("WARNING: Very high perplexity suggests possible issues:\n");
-        printf("  - Model not properly loaded\n");  
-        printf("  - Incorrect tokenization\n");
-        printf("  - FPGA computation errors\n");
-    } else if (perplexity < 2) {
-        printf("WARNING: Very low perplexity suggests possible issues:\n");
-        printf("  - Perfect overfitting (suspicious)\n");
-        printf("  - Calculation error\n");
-    } else {
-        printf("Perplexity in reasonable range for evaluation\n");
-    }
+    printf("Final perplexity: %.6f\n", perplexity);
     
     return perplexity;
 }
@@ -1132,7 +1118,6 @@ int main(int argc, char *argv[])
       
       // Run perplexity evaluation
       float ppl = evaluate_perplexity_on_file<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> (eval_file, &transformer, &tokenizer, kernelpath);
-      printf("Final perplexity: %.3f\n", ppl);
       
       // Cleanup and exit
       free_tokenizer(&tokenizer);
