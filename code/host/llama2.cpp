@@ -908,6 +908,10 @@ float evaluate_perplexity_on_file(const char* text_file,
     char line[4096];
     int lines_processed = 0;
     int total_sequences = 0;
+
+    long start_time = 0;
+    int total_inference_tokens = 0;
+    bool timing_started = false;
     
     printf("Starting evaluation...\n");
     
@@ -915,6 +919,11 @@ float evaluate_perplexity_on_file(const char* text_file,
         // Remove newline and show what we're processing
         line[strcspn(line, "\n")] = 0;
         if (strlen(line) == 0) continue;  // Skip empty lines
+        
+        if (strcmp(line, "<|endoftext|>") == 0) {
+            printf("Skipping endoftext marker\n");
+            continue;
+        }
         
         printf("\n--- Line %d ---\n", lines_processed + 1);
         printf("Text: \"%.60s%s\"\n", line, strlen(line) > 60 ? "..." : "");
@@ -940,6 +949,11 @@ float evaluate_perplexity_on_file(const char* text_file,
         for (int pos = 0; pos < num_tokens - 1; pos++) {
             int current_token = tokens[pos];
             int target_token = tokens[pos + 1];
+
+            if (!timing_started && total_inference_tokens == 0) {
+                start_time = time_in_ms();
+                timing_started = true;
+            }
             
             // Run your FPGA forward pass
             auto run = kernel(transformer_buffer, current_token, pos, key_buffer, value_buffer, out_buffer);
@@ -948,6 +962,8 @@ float evaluate_perplexity_on_file(const char* text_file,
             out_buffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             out_buffer.read(logits, transformer->config.vocab_size * sizeof(float), 0);
             
+            total_inference_tokens++;
+
             // Debug: Check logits sanity
             float logit_sum = 0.0f, logit_max = logits[0], logit_min = logits[0];
             for (int i = 0; i < vocab_size; i++) {
@@ -980,6 +996,12 @@ float evaluate_perplexity_on_file(const char* text_file,
     fclose(file);
     free(logits);
     
+    if (timing_started && total_inference_tokens > 0) {
+        long end_time = time_in_ms();
+        double tokens_per_second = (double)total_inference_tokens / (double)(end_time - start_time) * 1000;
+        fprintf(stderr, "achieved tok/s: %f\n", tokens_per_second);
+    }
+
     float perplexity = calculate_final_perplexity(&eval);
     
     printf("\n=== FINAL RESULTS ===\n");
@@ -987,7 +1009,6 @@ float evaluate_perplexity_on_file(const char* text_file,
     printf("Total tokens evaluated: %d\n", eval.total_tokens);
     printf("Average negative log likelihood: %.6f\n", -eval.total_log_prob / eval.total_tokens);
     printf("Final perplexity: %.6f\n", perplexity);
-    
     return perplexity;
 }
 
