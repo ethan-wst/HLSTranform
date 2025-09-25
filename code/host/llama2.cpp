@@ -9,6 +9,7 @@
 #include <iostream>
 #include <cstring>
 #include <fcntl.h>
+#include <algorithm>
 #include "typedefs.h"
 #include "forward.h"
 #include "config.h"
@@ -509,6 +510,15 @@ typedef struct
   unsigned long long rng_state;
 } Sampler;
 
+typedef struct 
+{
+  float total_log_prob;
+    int total_tokens; 
+    int vocab_size;
+    bool enabled;
+} PerplexityEval;
+
+
 int sample_argmax(float *probabilities, int n)
 {
   // return the index that has the highest probability
@@ -677,6 +687,56 @@ long time_in_ms()
 }
 
 // ----------------------------------------------------------------------------
+// utilities: perplexity evaluation
+float compute_log_prob(float *logits, int target_token, int vocab_size) {
+    // Find max logit for numerical stability
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+        }
+    }
+    
+    // Compute softmax denominator
+    float sum_exp = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    
+    // Calculate log probability
+    float target_logit = logits[target_token];
+    float log_prob = (target_logit - max_logit) - logf(sum_exp);
+    
+    // Debug output (uncomment for detailed debugging)
+    // printf("  [DEBUG] Target token: %d, Target logit: %.4f, Max logit: %.4f, Log prob: %.4f\n", 
+    //        target_token, target_logit, max_logit, log_prob);
+    
+    return log_prob;
+}
+
+void update_perplexity_eval(PerplexityEval* eval, float* logits, int target_token) {
+    if (!eval || !eval->enabled) return;
+    
+    float log_prob = compute_log_prob(logits, target_token, eval->vocab_size);
+    eval->total_log_prob += log_prob;
+    eval->total_tokens++;
+    
+    // Debug output for first few tokens and suspicious cases
+    if (eval->total_tokens <= 10 || log_prob < -10.0f) {
+        printf("  Token %d: target=%d, log_prob=%.4f, running_avg=%.4f\n", 
+               eval->total_tokens, target_token, log_prob, 
+               -eval->total_log_prob / eval->total_tokens);
+    }
+}
+
+float calculate_final_perplexity(PerplexityEval* eval) {
+    if (!eval || eval->total_tokens == 0) return -1.0f;
+    
+    float avg_nll = -eval->total_log_prob / eval->total_tokens;
+    return expf(avg_nll);
+}
+
+// ----------------------------------------------------------------------------
 // generation loop
 template <int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
 void generate(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, std::string &kernelpath)
@@ -806,6 +866,147 @@ void generate(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_
   free(prompt_tokens);
 }
 
+// ----------------------------------------------------------------------------
+// utilities: evaluates perplexity on wikitext-2 dataset
+template<int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
+float evaluate_perplexity_on_file(const char* text_file, 
+                                 Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS>* transformer,
+                                 Tokenizer* tokenizer,
+                                 const std::string& kernelpath) {
+    printf("=== PERPLEXITY EVALUATION DEBUG ===\n");
+    printf("File: %s\n", text_file);
+    printf("Model vocab size: %d\n", transformer->config.vocab_size);
+    printf("Model dimensions: %d x %d, %d layers\n", transformer->config.dim, transformer->config.hidden_dim, transformer->config.n_layers);
+    
+    FILE* file = fopen(text_file, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Cannot open %s\n", text_file);
+        return -1.0f;
+    }
+    
+    PerplexityEval eval = {0.0f, 0, transformer->config.vocab_size, true};
+    
+    // Initialize FPGA kernel (same setup as generate())
+    printf("Initializing FPGA kernel...\n");
+    auto device = xrt::device(0);
+    auto uuid = device.load_xclbin(kernelpath);
+    auto kernel = xrt::kernel(device, uuid, "forward");
+    
+    auto out_buffer = xrt::bo(device, transformer->config.vocab_size * sizeof(float), kernel.group_id(5));
+    int cache_dim = transformer->config.n_layers * transformer->config.seq_len * 
+                   ((transformer->config.dim * transformer->config.n_kv_heads) / transformer->config.n_heads);
+    
+    auto transformer_buffer = xrt::bo(device, sizeof(*transformer), kernel.group_id(0));
+    auto key_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(3));
+    auto value_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(4));
+    
+    transformer_buffer.write(transformer, sizeof(*transformer), 0);
+    transformer_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    
+    float* logits = (float*)malloc(transformer->config.vocab_size * sizeof(float));
+    
+    char line[4096];
+    int lines_processed = 0;
+    int total_sequences = 0;
+    
+    printf("Starting evaluation...\n");
+    
+    while (fgets(line, sizeof(line), file) && lines_processed < 20) { // Increased limit for better debugging
+        // Remove newline and show what we're processing
+        line[strcspn(line, "\n")] = 0;
+        if (strlen(line) == 0) continue;  // Skip empty lines
+        
+        printf("\n--- Line %d ---\n", lines_processed + 1);
+        printf("Text: \"%.60s%s\"\n", line, strlen(line) > 60 ? "..." : "");
+        
+        int num_tokens = 0;
+        int* tokens = (int*)malloc((strlen(line) + 3) * sizeof(int));
+        encode(tokenizer, line, 1, 0, tokens, &num_tokens);
+        
+        printf("Tokenized to %d tokens: ", num_tokens);
+        for (int i = 0; i < std::min(10, num_tokens); i++) {
+            printf("%d ", tokens[i]);
+        }
+        if (num_tokens > 10) printf("...");
+        printf("\n");
+        
+        if (num_tokens < 2) {
+            printf("Skipping line (too few tokens)\n");
+            free(tokens);
+            continue;
+        }
+        
+        // Process tokens sequentially 
+        for (int pos = 0; pos < num_tokens - 1; pos++) {
+            int current_token = tokens[pos];
+            int target_token = tokens[pos + 1];
+            
+            // Run your FPGA forward pass
+            auto run = kernel(transformer_buffer, current_token, pos, key_buffer, value_buffer, out_buffer);
+            run.wait();
+            
+            out_buffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            out_buffer.read(logits, transformer->config.vocab_size * sizeof(float), 0);
+            
+            // Debug: Check logits sanity
+            float logit_sum = 0.0f, logit_max = logits[0], logit_min = logits[0];
+            for (int i = 0; i < vocab_size; i++) {
+                logit_sum += logits[i];
+                if (logits[i] > logit_max) logit_max = logits[i];
+                if (logits[i] < logit_min) logit_min = logits[i];
+            }
+            
+            if (pos < 3 || eval.total_tokens < 10) {  // Debug first few tokens
+                printf("  Pos %d: input=%d->target=%d, logits[target]=%.3f, logit_range=[%.3f,%.3f]\n", 
+                       pos, current_token, target_token, logits[target_token], logit_min, logit_max);
+            }
+            
+            // Update perplexity
+            update_perplexity_eval(&eval, logits, target_token);
+        }
+        
+        free(tokens);
+        lines_processed++;
+        total_sequences++;
+        
+        // Show running perplexity
+        if (eval.total_tokens > 0) {
+            float running_ppl = expf(-eval.total_log_prob / eval.total_tokens);
+            printf("Running perplexity after line %d: %.3f (on %d tokens)\n", 
+                   lines_processed, running_ppl, eval.total_tokens);
+        }
+    }
+    
+    fclose(file);
+    free(logits);
+    
+    float perplexity = calculate_final_perplexity(&eval);
+    
+    printf("\n=== FINAL RESULTS ===\n");
+    printf("Lines processed: %d\n", lines_processed);
+    printf("Total tokens evaluated: %d\n", eval.total_tokens);
+    printf("Average negative log likelihood: %.6f\n", -eval.total_log_prob / eval.total_tokens);
+    printf("Final perplexity: %.3f\n", perplexity);
+    
+    // Sanity check
+    if (perplexity > 1000) {
+        printf("WARNING: Very high perplexity suggests possible issues:\n");
+        printf("  - Model not properly loaded\n");  
+        printf("  - Incorrect tokenization\n");
+        printf("  - FPGA computation errors\n");
+    } else if (perplexity < 2) {
+        printf("WARNING: Very low perplexity suggests possible issues:\n");
+        printf("  - Perfect overfitting (suspicious)\n");
+        printf("  - Calculation error\n");
+    } else {
+        printf("Perplexity in reasonable range for evaluation\n");
+    }
+    
+    return perplexity;
+}
+
+
+
 void read_stdin(const char *guide, char *buffer, size_t bufsize)
 {
   // read a line from stdin, up to but not including \n
@@ -837,6 +1038,7 @@ void error_usage()
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
   fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+  fprintf(stderr, "  -e <file>    evaluate perplexity on text file\n");
   exit(EXIT_FAILURE);
 }
 
@@ -916,6 +1118,25 @@ int main(int argc, char *argv[])
     else if (argv[i][1] == 'k')
     {
       kernelpath = argv[i + 1];
+    }
+    else if (argv[i][1] == 'e') {
+      // Perplexity evaluation mode
+      const char* eval_file = argv[i + 1];
+      
+      // Build transformer and tokenizer as normal
+      static Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> transformer;
+      build_transformer(&transformer, checkpoint_path);
+      
+      Tokenizer tokenizer;
+      build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+      
+      // Run perplexity evaluation
+      float ppl = evaluate_perplexity_on_file<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> (eval_file, &transformer, &tokenizer, kernelpath);
+      printf("Final perplexity: %.3f\n", ppl);
+      
+      // Cleanup and exit
+      free_tokenizer(&tokenizer);
+      return 0;
     }
     else
     {

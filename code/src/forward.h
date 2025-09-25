@@ -37,7 +37,7 @@ void dequantize(QuantizedTensor<S> *qx, float x[S], int GS) {
 
 template<int S>
 void quantize(QuantizedTensor<S> *qx, float x[S], int GS) {
-    constexpr int num_groups = S / 64;
+    constexpr int num_groups = S / GS;      // changed from hard coded 64
     constexpr float Q_MAX = 127.0f;
     
     float scale_buffer[num_groups];
