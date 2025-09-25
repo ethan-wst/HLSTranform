@@ -720,13 +720,6 @@ void update_perplexity_eval(PerplexityEval* eval, float* logits, int target_toke
     float log_prob = compute_log_prob(logits, target_token, eval->vocab_size);
     eval->total_log_prob += log_prob;
     eval->total_tokens++;
-    
-    // Debug output for first few tokens and suspicious cases
-    if (eval->total_tokens <= 10 || log_prob < -10.0f) {
-        printf("  Token %d: target=%d, log_prob=%.4f, running_avg=%.4f\n", 
-               eval->total_tokens, target_token, log_prob, 
-               -eval->total_log_prob / eval->total_tokens);
-    }
 }
 
 float calculate_final_perplexity(PerplexityEval* eval) {
@@ -904,77 +897,74 @@ float evaluate_perplexity_on_file(const char* text_file,
     transformer_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     
     float* logits = (float*)malloc(transformer->config.vocab_size * sizeof(float));
-    
-    char line[4096];
-    int lines_processed = 0;
-    int total_sequences = 0;
 
     long start_time = 0;
     int total_inference_tokens = 0;
     bool timing_started = false;
+
+    // Story processing variables
+    std::string current_story = "";
+    char line[4096];
+    int stories_processed = 0;
+    int global_pos = 0;  // Continuous position across entire evaluation
     
     printf("Starting evaluation...\n");
     
-    while (fgets(line, sizeof(line), file) && lines_processed < 20) { // Increased limit for better debugging
-        // Remove newline and show what we're processing
-        line[strcspn(line, "\n")] = 0;
-        if (strlen(line) == 0) continue;  // Skip empty lines
+    // HELPER LAMBDA to process a complete story
+    auto process_story = [&](const std::string& story_text, int story_num) {
+        if (story_text.empty()) return;
+        if (story_num > 25) return;   // Limit stories for debugging
         
-        if (strcmp(line, "<|endoftext|>") == 0) {
-            printf("Skipping endoftext marker\n");
-            continue;
-        }
+        printf("\n=== Story %d ===\n", story_num);
+        printf("Story text: \"%.80s%s\"\n", story_text.c_str(), 
+               story_text.length() > 80 ? "..." : "");
         
-        printf("\n--- Line %d ---\n", lines_processed + 1);
-        printf("Text: \"%.60s%s\"\n", line, strlen(line) > 60 ? "..." : "");
-        
+        // Tokenize entire story
         int num_tokens = 0;
-        int* tokens = (int*)malloc((strlen(line) + 3) * sizeof(int));
-        encode(tokenizer, line, 1, 0, tokens, &num_tokens);
+        int* tokens = (int*)malloc((story_text.length() + 3) * sizeof(int));
+        char* mutable_text = strdup(story_text.c_str());
+        encode(tokenizer, mutable_text, 1, 0, tokens, &num_tokens);
+        free(mutable_text); 
         
-        printf("Tokenized to %d tokens: ", num_tokens);
-        for (int i = 0; i < std::min(10, num_tokens); i++) {
-            printf("%d ", tokens[i]);
-        }
-        if (num_tokens > 10) printf("...");
-        printf("\n");
+        printf("Story tokenized to %d tokens\n", num_tokens);
         
         if (num_tokens < 2) {
-            printf("Skipping line (too few tokens)\n");
+            printf("Skipping story (too few tokens)\n");
             free(tokens);
-            continue;
+            return;
         }
         
-        // Process tokens sequentially 
-        for (int pos = 0; pos < num_tokens - 1; pos++) {
-            int current_token = tokens[pos];
-            int target_token = tokens[pos + 1];
-
+        // Process all tokens in story with continuous context
+        for (int local_pos = 0; local_pos < num_tokens - 1; local_pos++) {
+            int current_token = tokens[local_pos];
+            int target_token = tokens[local_pos + 1];
+            
+            // Start timing after first inference
             if (!timing_started && total_inference_tokens == 0) {
                 start_time = time_in_ms();
                 timing_started = true;
             }
             
-            // Run your FPGA forward pass
-            auto run = kernel(transformer_buffer, current_token, pos, key_buffer, value_buffer, out_buffer);
+            // Run FPGA forward pass with GLOBAL position
+            auto run = kernel(transformer_buffer, current_token, global_pos, 
+                            key_buffer, value_buffer, out_buffer);
             run.wait();
             
             out_buffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             out_buffer.read(logits, transformer->config.vocab_size * sizeof(float), 0);
             
             total_inference_tokens++;
-
-            // Debug: Check logits sanity
-            float logit_sum = 0.0f, logit_max = logits[0], logit_min = logits[0];
-            for (int i = 0; i < vocab_size; i++) {
-                logit_sum += logits[i];
-                if (logits[i] > logit_max) logit_max = logits[i];
-                if (logits[i] < logit_min) logit_min = logits[i];
-            }
+            global_pos++;  // Increment global position
             
-            if (pos < 3 || eval.total_tokens < 10) {  // Debug first few tokens
-                printf("  Pos %d: input=%d->target=%d, logits[target]=%.3f, logit_range=[%.3f,%.3f]\n", 
-                       pos, current_token, target_token, logits[target_token], logit_min, logit_max);
+            // Debug first few tokens of each story
+            if (local_pos < 3) {
+                float logit_max = logits[0], logit_min = logits[0];
+                for (int i = 0; i < vocab_size; i++) {
+                    if (logits[i] > logit_max) logit_max = logits[i];
+                    if (logits[i] < logit_min) logit_min = logits[i];
+                }
+                printf("  Global pos %d: input=%d->target=%d, logits[target]=%.3f, range=[%.3f,%.3f]\n", 
+                       global_pos-1, current_token, target_token, logits[target_token], logit_min, logit_max);
             }
             
             // Update perplexity
@@ -982,33 +972,67 @@ float evaluate_perplexity_on_file(const char* text_file,
         }
         
         free(tokens);
-        lines_processed++;
-        total_sequences++;
         
         // Show running perplexity
         if (eval.total_tokens > 0) {
             float running_ppl = expf(-eval.total_log_prob / eval.total_tokens);
-            printf("Running perplexity after line %d: %.3f (on %d tokens)\n", 
-                   lines_processed, running_ppl, eval.total_tokens);
+            printf("Running perplexity after story %d: %.3f (on %d tokens)\n", 
+                   story_num, running_ppl, eval.total_tokens);
+        }
+    };
+    
+    // Main file reading loop
+    while (fgets(line, sizeof(line), file) && stories_processed < 10) {  // Limit stories for debugging
+        line[strcspn(line, "\n")] = 0;  // Remove newline
+        
+        if (strlen(line) == 0) continue;  // Skip empty lines
+        
+        if (strcmp(line, "<|endoftext|>") == 0) {
+            // End of story boundary - process accumulated story
+            if (!current_story.empty()) {
+                process_story(current_story, stories_processed + 1);
+                stories_processed++;
+                current_story = "";  // Reset for next story
+
+                key_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Clear key cache
+                value_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Clear value cache
+                global_pos = 0;
+                
+            }
+        } else {
+            // Accumulate lines into current story
+            if (!current_story.empty()) {
+                current_story += " ";  // Add space between lines
+            }
+            current_story += line;
         }
     }
+    
+    // Process final story if file doesn't end with <|endoftext|>
+    if (!current_story.empty()) {
+        process_story(current_story, stories_processed + 1);
+        stories_processed++;
+    }
+
     
     fclose(file);
     free(logits);
     
-    if (timing_started && total_inference_tokens > 0) {
-        long end_time = time_in_ms();
-        double tokens_per_second = (double)total_inference_tokens / (double)(end_time - start_time) * 1000;
-        fprintf(stderr, "achieved tok/s: %f\n", tokens_per_second);
-    }
+   
 
     float perplexity = calculate_final_perplexity(&eval);
     
     printf("\n=== FINAL RESULTS ===\n");
-    printf("Lines processed: %d\n", lines_processed);
+    printf("Stories processed: %d\n", stories_processed);
     printf("Total tokens evaluated: %d\n", eval.total_tokens);
     printf("Average negative log likelihood: %.6f\n", -eval.total_log_prob / eval.total_tokens);
     printf("Final perplexity: %.6f\n", perplexity);
+     if (timing_started && total_inference_tokens > 0) {
+        long end_time = time_in_ms();
+        double tokens_per_second = (double)total_inference_tokens / (double)(end_time - start_time) * 1000;
+        fprintf(stderr, "Achieved tok/s: %f\n", tokens_per_second);
+        
+    }
     return perplexity;
 }
 
