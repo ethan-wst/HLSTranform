@@ -913,7 +913,6 @@ float evaluate_perplexity_on_file(const char* text_file,
     // HELPER LAMBDA to process a complete story
     auto process_story = [&](const std::string& story_text, int story_num) {
         if (story_text.empty()) return;
-        if (story_num > 25) return;   // Limit stories for debugging
         
         printf("\n=== Story %d ===\n", story_num);
         printf("Story text: \"%.80s%s\"\n", story_text.c_str(), 
@@ -982,7 +981,7 @@ float evaluate_perplexity_on_file(const char* text_file,
     };
     
     // Main file reading loop
-    while (fgets(line, sizeof(line), file) && stories_processed < 10) {  // Limit stories for debugging
+    while (fgets(line, sizeof(line), file) && stories_processed < 25) {  // Limit stories for debugging
         line[strcspn(line, "\n")] = 0;  // Remove newline
         
         if (strlen(line) == 0) continue;  // Skip empty lines
