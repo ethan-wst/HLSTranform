@@ -44,7 +44,7 @@ extern "C" void forward(
 
     // Pre-compute reciprocals for frequent divisions
     static const float inv_head_size = 1.0f / float(head_size);  // For attention scaling
-    static const float inv_sqrt_head_size = 1.0f / hls::sqrt(float(head_size));  // HLS sqrt
+    static const float inv_sqrt_head_size = 1.0f / hls::sqrt(float(head_size));  //may have no benefit 
     constexpr float inv_10000 = 1.0f / 10000.0f;  // For RoPE frequency
     
     // Static arrays (unchanged)
@@ -191,7 +191,7 @@ extern "C" void forward(
         for (int i = 0; i < hidden_dim; i++) {
             float val = hb[i];
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            float exp_neg_val = hls::exp(-val);
+            float exp_neg_val = hls::exp(-val); // seemingly no benefit
             val *= (1.0f / (1.0f + exp_neg_val));  // Reciprocal form of sigmoid
             // elementwise multiply with w3(x)
             val *= hb2[i];
@@ -231,10 +231,9 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
         ss += x_j * x_j;
     }
 
-    // OPTIMIZED: Use reciprocal multiplication and HLS sqrt
     ss /= S;
     ss += 1e-5f;
-    float inv_sqrt_ss = 1.0f / hls::sqrt(ss);  // HLS sqrt + reciprocal
+    float inv_sqrt_ss = 1.0f / hls::sqrt(ss);   //seemingly no benefit
 
     norm_and_scale:
     for (int j = 0; j < S; j++) {
@@ -260,7 +259,7 @@ void softmax(float *x, int size) {
     
     exp_and_sum:
     for (int i = 0; i < size; i++) {
-        float x_i = hls::exp(x[i] - max_val);
+        float x_i = hls::exp(x[i] - max_val);   //unkown benefti
         x[i] = x_i;  // Store back directly
         sum += x_i;
     }
