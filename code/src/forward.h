@@ -22,6 +22,9 @@ void rmsnorm(float o[S], float x[S], float weight[S]);
 template<int D, int N, int GS>
 void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
 
+template<int D, int N, int GS>
+void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
+
 template<int MAXSIZE>
 void softmax(float *x, int size);
 
