@@ -222,26 +222,22 @@ extern "C" void forward(
 // Implementation of neural network building blocks
 template<int S>
 void rmsnorm(float o[S], float x[S], float weight[S]) {
-    // Pre-computed reciprocal
-    constexpr float inv_S = 1.0f / float(S);  
     // Calculate sum of squares
     float ss = 0.0f;
     
     sum_of_squares:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE II=1
         float x_j = x[j];
         ss += x_j * x_j;
     }
 
     // OPTIMIZED: Use reciprocal multiplication and HLS sqrt
-    ss *= inv_S;  // Instead of ss /= S
+    ss /= S;
     ss += 1e-5f;
     float inv_sqrt_ss = 1.0f / hls::sqrt(ss);  // HLS sqrt + reciprocal
 
     norm_and_scale:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE II=1
         o[j] = weight[j] * (inv_sqrt_ss * x[j]);
     }
 }
