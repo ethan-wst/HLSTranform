@@ -362,7 +362,6 @@ void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
         for (int u = 0; u < 4; u++) {
             acc[u] = 0.0f; // Initialize accumulators
         }
-
         matmul_groups:
         for (int j = 0; j <= N - GS; j += GS) {
             #pragma HLS PIPELINE II=1
@@ -376,28 +375,19 @@ void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
 
                 int8_t x_val = xq[j + k];
                 for (int u = 0; u < 4; u++) {
-                    int32_t dot_t;
-                    #pragma HLS BIND_OP variable=dot_t op=fmul impl=fulldsp
-                    dot_t = ((int32_t)x_val) * ((int32_t)wq[(i + u) * N + j + k]);
-                    dot[u] += dot_t;
+                    dot[u] += ((int32_t)x_val) * ((int32_t)wq[(i + u) * N + j + k]);
                 }
             }
-
             // Scale, accumulate, and convert to float
             for (int u = 0; u < 4; u++) {
-                float acc_t;
-                #pragma HLS BIND_OP variable=acc_t op=fmul impl=fulldsp
                 float scale = ws[(i + u) * N / GS + j / GS] * xs[j / GS];
-                acc_t = ((float)dot[u]) * scale;
-                acc[u] += acc_t;
+                acc[u] += ((float)dot[u]) * scale;
             }
-
         }
         for (int u = 0; u < 4; u++) {
             xout[i + u] = acc[u];
         }
     }
-
 }
 
 
