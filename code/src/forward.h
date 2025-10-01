@@ -3,7 +3,6 @@
 #include <ap_int.h>
 #include <hls_stream.h>
 
-//typedef Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> Transformer;
 
 // Forward declaration with concrete types
 extern "C" void forward(
