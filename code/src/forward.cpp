@@ -329,8 +329,10 @@ void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
             int32_t dot[4];
             #pragma HLS ARRAY_PARTITION variable=dot complete
 
-            
-
+            for (int u = 0; u < 4; u++) {
+                #pragma HLS UNROLL
+                dot[u] = 0;
+            }
 
             dot_product:
             for (int k = 0; k < GS; k++) {
