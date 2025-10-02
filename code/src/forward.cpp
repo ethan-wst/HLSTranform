@@ -73,109 +73,41 @@ extern "C" void forward(
         // Process the portion where both query and key vectors are involved (i < kv_dim)
         rotation1:
         for (int i = 0; i < kv_dim; i += 2) {
-            #pragma HLS PIPELINE II=1
             int head_dim = i % head_size;
-
-            float head_dim_scaled, val;
-            #pragma HLS bind_op variable=head_dim_scaled op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=val op=fmul impl=fulldsp
-
-            head_dim_scaled = head_dim * inv_head_size;
-            float freq = hls::pow(inv_10000, head_dim_scaled);
-            val = pos * freq;
-            
-            // Complex CORDIC/LUT functions, cannot be DSP-mapped
-            float fcr = hls::cos(val);
-            float fci = hls::sin(val);
+            // OPTIMIZED: Use reciprocal multiplication instead of division
+            float freq = hls::pow(inv_10000, head_dim * inv_head_size);
+            float val = pos * freq;
+            float fcr = hls::cos(val);  // HLS optimized cosine
+            float fci = hls::sin(val);  // HLS optimized sine
             
             // Rotate the query vector
             float v0_q = q[i];
             float v1_q = q[i + 1];
-
+            q[i] = v0_q * fcr - v1_q * fci;
+            q[i + 1] = v0_q * fci + v1_q * fcr;
+            
             // Rotate the key vector
             float v0_k = k[i];
             float v1_k = k[i + 1];
-
-            // DSP optimization for rotation calculations - Query vector
-            float q_mul1, q_mul2, q_mul3, q_mul4, q_result1, q_result2;
-            #pragma HLS bind_op variable=q_mul1 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=q_mul2 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=q_result1 op=fsub impl=fulldsp
-
-            #pragma HLS bind_op variable=q_mul3 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=q_mul4 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=q_result2 op=fadd impl=fulldsp
-
-            q_mul1 = v0_q * fcr;
-            q_mul2 = v1_q * fci;
-            q_result1 = q_mul1 - q_mul2;
-            q[i] = q_result1;  // Assign to array after DSP operation
-
-            q_mul3 = v0_q * fci;
-            q_mul4 = v1_q * fcr;
-            q_result2 = q_mul3 + q_mul4;
-            q[i + 1] = q_result2;  // Assign to array after DSP operation
-            
-            // DSP optimization for rotation calculations - Key vector
-            float k_mul1, k_mul2, k_mul3, k_mul4, k_result1, k_result2;
-            #pragma HLS bind_op variable=k_mul1 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=k_mul2 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=k_result1 op=fsub impl=fulldsp
-
-            #pragma HLS bind_op variable=k_mul3 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=k_mul4 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=k_result2 op=fadd impl=fulldsp
-
-            k_mul1 = v0_k * fcr;
-            k_mul2 = v1_k * fci;
-            k_result1 = k_mul1 - k_mul2;
-            k[i] = k_result1;  // Assign to array after DSP operation
-
-            k_mul3 = v0_k * fci;
-            k_mul4 = v1_k * fcr;
-            k_result2 = k_mul3 + k_mul4;
-            k[i + 1] = k_result2;  // Assign to array after DSP operation
+            k[i] = v0_k * fcr - v1_k * fci;
+            k[i + 1] = v0_k * fci + v1_k * fcr;
         }
         
         rotation2:
         // Rotation for only the query vector (i >= kv_dim)
         for (int i = kv_dim; i < dim; i += 2) {
-            #pragma HLS PIPELINE II=1
             int head_dim = i % head_size;
-
-            float head_dim_scaled, val;
-            #pragma HLS bind_op variable=head_dim_scaled op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=val op=fmul impl=fulldsp
-
-            head_dim_scaled = head_dim * inv_head_size;
-            float freq = hls::pow(inv_10000, head_dim_scaled);
-            val = pos * freq;
-
-            float fcr = hls::cos(val);
-            float fci = hls::sin(val);
+            // OPTIMIZED: Use reciprocal multiplication instead of division
+            float freq = hls::pow(inv_10000, head_dim * inv_head_size);
+            float val = pos * freq;
+            float fcr = hls::cos(val);  // HLS optimized cosine
+            float fci = hls::sin(val);  // HLS optimized sine
             
+            // Rotate only the query vector
             float v0 = q[i];
             float v1 = q[i + 1];
-            
-            // DSP optimization for rotation calculations - Query vector
-            float mul1, mul2, mul3, mul4, result1, result2;
-            #pragma HLS bind_op variable=mul1 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=mul2 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=result1 op=fsub impl=fulldsp
-
-            #pragma HLS bind_op variable=mul3 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=mul4 op=fmul impl=fulldsp
-            #pragma HLS bind_op variable=result2 op=fadd impl=fulldsp
-
-            mul1 = v0 * fcr;
-            mul2 = v1 * fci;
-            result1 = mul1 - mul2;
-            q[i] = result1;  // Assign to array after DSP operation
-
-            mul3 = v0 * fci;
-            mul4 = v1 * fcr;
-            result2 = mul3 + mul4;
-            q[i + 1] = result2;  // Assign to array after DSP operation
+            q[i] = v0 * fcr - v1 * fci;
+            q[i + 1] = v0 * fci + v1 * fcr;
         }
         
         // Save key,value at this time step (pos) to our kv cache
@@ -236,7 +168,7 @@ extern "C" void forward(
 
         // Final matmul to get the output of the attention
         quantize<dim>(&xq, xb, GS);
-        matmul<dim, dim, GS>(xb2, xq.q, xq.s, (w->wo + l)->q, (w->wo + l)->s);
+        matmul_optimized<dim, dim, GS>(xb2, xq.q, xq.s, (w->wo + l)->q, (w->wo + l)->s);
         
         // Residual connection back into x
         residual:
@@ -250,8 +182,8 @@ extern "C" void forward(
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // First calculate self.w1(x) and self.w3(x)
         quantize<dim>(&xq, xb, GS);
-        matmul<hidden_dim, dim, GS>(hb, xq.q, xq.s, (w->w1 + l)->q, (w->w1 + l)->s);
-        matmul<hidden_dim, dim, GS>(hb2, xq.q, xq.s, (w->w3 + l)->q, (w->w3 + l)->s);
+        matmul_optimized<hidden_dim, dim, GS>(hb, xq.q, xq.s, (w->w1 + l)->q, (w->w1 + l)->s);
+        matmul_optimized<hidden_dim, dim, GS>(hb2, xq.q, xq.s, (w->w3 + l)->q, (w->w3 + l)->s);
         
         float hb_out[hidden_dim];
         
@@ -271,7 +203,7 @@ extern "C" void forward(
 
         // Final matmul to get the output of the ffn
         quantize<hidden_dim>(&hq, hb, GS);
-        matmul<dim, hidden_dim, GS>(xb, hq.q, hq.s, (w->w2 + l)->q, (w->w2 + l)->s);
+        matmul_optimized<dim, hidden_dim, GS>(xb, hq.q, hq.s, (w->w2 + l)->q, (w->w2 + l)->s);
         
         // Residual connection
         residual2:
@@ -285,7 +217,7 @@ extern "C" void forward(
     
     // Classifier into logits
     quantize<dim>(&xq, x, GS);
-    matmul<vocab_size, dim, GS>(out, xq.q, xq.s, w->wcls->q, w->wcls->s);
+    matmul_optimized<vocab_size, dim, GS>(out, xq.q, xq.s, w->wcls->q, w->wcls->s);
 }
 
 // Implementation of neural network building blocks
@@ -298,7 +230,6 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
     
     sum_of_squares:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE II=1
         float x_j = x[j];
         ss += x_j * x_j;
     }
@@ -310,7 +241,6 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
 
     norm_and_scale:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE II=1
         o[j] = weight[j] * (inv_sqrt_ss * x[j]);
     }
 }
@@ -349,17 +279,45 @@ void softmax(float *x, int size) {
 
 template<int D, int N, int GS>
 void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
-    #pragma HLS PIPELINE II=1
+
+    #pragma HLS INTERFACE m_axi port=xout bundle=gmem0 depth=D max_read_burst_length=128
+    #pragma HLS INTERFACE m_axi port=xq bundle=gmem1 depth=N max_read_burst_length=128
+    #pragma HLS INTERFACE m_axi port=xs bundle=gmem2 depth=N/GS max_read_burst_length=128
+    #pragma HLS INTERFACE m_axi port=wq bundle=gmem3 depth=D*N max_read_burst_length=128
+    #pragma HLS INTERFACE m_axi port=ws bundle=gmem4 depth=D*N max_read_burst_length=128
+    #pragma HLS INTERFACE s_axilite port=return
+
+    int8_t local_xq[N];
+    float local_xs[N/GS];
+    #pragma HLS ARRAY_PARTITION variable=local_xq cyclic factor=16 dim=1
+    #pragma HLS ARRAY_PARTITION variable=local_xs complete
+    
+
+    // Burst read input data once
+    burst_read_xq: 
+    for (int i = 0; i < N; i++) {
+        #pragma HLS PIPELINE II=1
+        local_xq[i] = xq[i];
+    }
+    
+    burst_read_xs: 
+    for (int i = 0; i < N/GS; i++) {
+        #pragma HLS PIPELINE II=1
+        local_xs[i] = xs[i];
+    }
+
 
     // Partition local accumulator array for parallel summations
     float acc[4];
     #pragma HLS ARRAY_PARTITION variable=acc complete
+    
 
     matmul_outer:
     for (int i = 0; i < D; i+=4) {
         #pragma HLS UNROLL factor=4 
 
         for (int u = 0; u < 4; u++) {
+            #pragma HLS UNROLL factor=4
             acc[u] = 0.0f; // Initialize accumulators
         }
         matmul_groups:
@@ -373,18 +331,22 @@ void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
             for (int k = 0; k < GS; k++) {
                 #pragma HLS UNROLL factor=4
 
-                int8_t x_val = xq[j + k];
+                int8_t x_val = local_xq[j + k];
+                compute_mac:
                 for (int u = 0; u < 4; u++) {
+                    #pragma HLS UNROLL
                     dot[u] += ((int32_t)x_val) * ((int32_t)wq[(i + u) * N + j + k]);
                 }
             }
             // Scale, accumulate, and convert to float
             for (int u = 0; u < 4; u++) {
-                float scale = ws[(i + u) * N / GS + j / GS] * xs[j / GS];
+                #pragma HLS UNROLL
+                float scale = ws[(i + u) * N / GS + j / GS] * local_xs[j / GS];
                 acc[u] += ((float)dot[u]) * scale;
             }
         }
         for (int u = 0; u < 4; u++) {
+            #pragma HLS UNROLL
             xout[i + u] = acc[u];
         }
     }
@@ -419,7 +381,6 @@ void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
 template void rmsnorm<dim>(float o[dim], float x[dim], float weight[dim]);
 template void rmsnorm<hidden_dim>(float o[hidden_dim], float x[hidden_dim], float weight[hidden_dim]);
 template void softmax<seq_len>(float *x, int size);
-template void matmul<dim, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
-template void matmul<hidden_dim, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
-template void matmul<vocab_size, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
+template void matmul_optimized<hidden_dim, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
+template void matmul_optimized<vocab_size, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
 template void matmul_optimized<dim, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
