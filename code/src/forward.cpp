@@ -317,31 +317,43 @@ void matmul_optimized(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws)
         #pragma HLS UNROLL factor=4 
 
         for (int u = 0; u < 4; u++) {
-            #pragma HLS UNROLL factor=4
+            #pragma HLS UNROLL
             acc[u] = 0.0f; // Initialize accumulators
         }
         matmul_groups:
         for (int j = 0; j <= N - GS; j += GS) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS PIPELINE II=2
+
+
 
             int32_t dot[4];
             #pragma HLS ARRAY_PARTITION variable=dot complete
 
+            
+
+
             dot_product:
             for (int k = 0; k < GS; k++) {
-                #pragma HLS UNROLL factor=4
+                #pragma HLS UNROLL factor=16
 
                 int8_t x_val = local_xq[j + k];
                 compute_mac:
                 for (int u = 0; u < 4; u++) {
                     #pragma HLS UNROLL
-                    dot[u] += ((int32_t)x_val) * ((int32_t)wq[(i + u) * N + j + k]);
+                    int32_t dot_t = 0;
+
+                    #pragma HLS BIND_OP variable=dot_t op=mul impl=dsp
+                    dot_t += ((int32_t)x_val) * ((int32_t)wq[(i + u) * N + j + k]);
+                    dot[u] += dot_t;
                 }
             }
             // Scale, accumulate, and convert to float
             for (int u = 0; u < 4; u++) {
                 #pragma HLS UNROLL
-                float scale = ws[(i + u) * N / GS + j / GS] * local_xs[j / GS];
+                float scale = 0;
+
+                #pragma HLS BIND_OP variable=scale op=fmul impl=fabric
+                scale = ws[(i + u) * N / GS + j / GS] * local_xs[j / GS];
                 acc[u] += ((float)dot[u]) * scale;
             }
         }
