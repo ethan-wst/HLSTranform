@@ -2,7 +2,6 @@
 #include "config.h"
 #include <cstring>
 #include <cmath>
-#include <hls_math.h>
 
 // Main forward function with minimal interface pragmas
 extern "C" void forward(
@@ -13,12 +12,15 @@ extern "C" void forward(
     float value_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], 
     float *out
 ) {
-    // Minimal interface pragmas
+
+    // Disable automatic inlining 
+    #pragma HLS INLINE off
+
+    // Interface pragmas
     #pragma HLS INTERFACE m_axi port=transformer offset=slave
     #pragma HLS INTERFACE m_axi port=key_cache offset=slave
     #pragma HLS INTERFACE m_axi port=value_cache offset=slave
     #pragma HLS INTERFACE m_axi port=out offset=slave
-    
     // Control interface for scalars
     #pragma HLS INTERFACE s_axilite port=token
     #pragma HLS INTERFACE s_axilite port=pos
@@ -43,21 +45,21 @@ extern "C" void forward(
     constexpr int head_size = dim / n_heads;                                // dimension of each attention head
 
     // Pre-compute reciprocals for frequent divisions
-    static const float inv_head_size = 1.0f / float(head_size);  // For attention scaling
-    static const float inv_sqrt_head_size = 1.0f / hls::sqrt(float(head_size));  //may have no benefit 
-    constexpr float inv_10000 = 1.0f / 10000.0f;  // For RoPE frequency
-    
-    // Static arrays (unchanged)
-    
+    static const float inv_head_size = 1.0f / float(head_size);
+    static const float inv_sqrt_head_size = 1.0f / sqrtf(float(head_size));
+    constexpr float inv_10000 = 1.0f / 10000.0f;
+        
     // Access transformer weights
     auto w = &transformer->weights;
     
     // Copy the token embedding into x
     std::memcpy(x, w->token_embedding_table + token * dim, dim * sizeof(float));
     
-    // Forward all the layers
     main_forward_loop:
     for (int l = 0; l < n_layers; l++) {
+        // Disable automatic loop optimizations
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off
         
         // Attention rmsnorm
         rmsnorm<dim>(xb, x, w->rms_att_weight + l * dim);
@@ -68,16 +70,17 @@ extern "C" void forward(
         matmul<kv_dim, dim, GS>(k, xq.q, xq.s, (w->wk + l)->q, (w->wk + l)->s);
         matmul<kv_dim, dim, GS>(v, xq.q, xq.s, (w->wv + l)->q, (w->wv + l)->s);
         
-        // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        // Process the portion where both query and key vectors are involved (i < kv_dim)
+        // RoPE
         rotation1:
         for (int i = 0; i < kv_dim; i += 2) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
+
             int head_dim = i % head_size;
-            // OPTIMIZED: Use reciprocal multiplication instead of division
-            float freq = hls::pow(inv_10000, head_dim * inv_head_size);
+            float freq = powf(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
-            float fcr = hls::cos(val);  // HLS optimized cosine
-            float fci = hls::sin(val);  // HLS optimized sine
+            float fcr = cosf(val);
+            float fci = sinf(val);
             
             // Rotate the query vector
             float v0_q = q[i];
@@ -95,12 +98,13 @@ extern "C" void forward(
         rotation2:
         // Rotation for only the query vector (i >= kv_dim)
         for (int i = kv_dim; i < dim; i += 2) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
             int head_dim = i % head_size;
-            // OPTIMIZED: Use reciprocal multiplication instead of division
-            float freq = hls::pow(inv_10000, head_dim * inv_head_size);
+            float freq = powf(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
-            float fcr = hls::cos(val);  // HLS optimized cosine
-            float fci = hls::sin(val);  // HLS optimized sine
+            float fcr = cosf(val);
+            float fci = sinf(val);
             
             // Rotate only the query vector
             float v0 = q[i];
@@ -110,15 +114,17 @@ extern "C" void forward(
         }
         
         // Save key,value at this time step (pos) to our kv cache
-        int loff = l * seq_len * kv_dim;                                   // kv cache layer offset for convenience
+        int loff = l * seq_len * kv_dim;
         float *key_cache_row = key_cache + loff + pos * kv_dim;
         float *value_cache_row = value_cache + loff + pos * kv_dim;
         std::memcpy(key_cache_row, k, kv_dim * sizeof(*key_cache_row));
         std::memcpy(value_cache_row, v, kv_dim * sizeof(*value_cache_row));
         
-        // Multihead attention. iterate over all heads
         multihead_attention:
         for (int h = 0; h < n_heads; h++) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
+
             // Get the query vector for this head
             const int q_offset = h * head_size;
             
@@ -128,12 +134,19 @@ extern "C" void forward(
             // Iterate over all timesteps, including the current one
             iterate:
             for (int t = 0; t <= pos; t++) {
+                #pragma HLS PIPELINE off
+                #pragma HLS UNROLL off=true
+
                 // Get the key vector for this head and at this timestep
                 const int key_offset = loff + t * kv_dim + (h / kv_mul) * head_size;
                 
                 // Calculate the attention score as the dot product of q and k
                 float score = 0.0f;
+                attention_dot:
                 for (int i = 0; i < head_size; i++) {
+                    #pragma HLS PIPELINE off
+                    #pragma HLS UNROLL off=true
+
                     score += q[i + q_offset] * key_cache[i + key_offset];
                 }
                 score *= inv_sqrt_head_size;  // Scale the score
@@ -151,6 +164,9 @@ extern "C" void forward(
             
             acc:
             for (int t = 0; t <= pos; t++) {
+                #pragma HLS PIPELINE off
+                #pragma HLS UNROLL off=true
+
                 // Get the value vector for this head and at this timestep
                 const int v_offset = loff + t * kv_dim + (h / kv_mul) * head_size;
                 
@@ -160,6 +176,9 @@ extern "C" void forward(
                 // Accumulate the weighted value into xb
                 acc_inner:
                 for (int i = 0; i < head_size; i++) {
+                    #pragma HLS PIPELINE off
+                    #pragma HLS UNROLL off=true
+
                     xb[i + xb_offset] += a * value_cache[i + v_offset];
                 }
             }
@@ -172,6 +191,9 @@ extern "C" void forward(
         // Residual connection back into x
         residual:
         for (int i = 0; i < dim; i++) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
+
             x[i] += xb2[i];
         }
 
@@ -189,10 +211,15 @@ extern "C" void forward(
         // SwiGLU activation: silu(x) = x * sigmoid(x)
         swi_glu:
         for (int i = 0; i < hidden_dim; i++) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
+
             float val = hb[i];
+
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            float exp_neg_val = hls::exp(-val); // seemingly no benefit
-            val *= (1.0f / (1.0f + exp_neg_val));  // Reciprocal form of sigmoid
+            float exp_neg_val = expf(-val);
+            val *= (1.0f / (1.0f + exp_neg_val));
+
             // elementwise multiply with w3(x)
             val *= hb2[i];
             hb_out[i] = val;
@@ -200,18 +227,17 @@ extern "C" void forward(
         
         std::memcpy(hb, hb_out, hidden_dim * sizeof(float));
 
-        // Final matmul to get the output of the ffn
         quantize<hidden_dim>(&hq, hb, GS);
         matmul<dim, hidden_dim, GS>(xb, hq.q, hq.s, (w->w2 + l)->q, (w->w2 + l)->s);
         
-        // Residual connection
         residual2:
         for (int i = 0; i < dim; i++) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
             x[i] += xb[i];
         }
     }
     
-    // Final rmsnorm
     rmsnorm<dim>(x, x, w->rms_final_weight);
     
     // Classifier into logits
@@ -219,35 +245,47 @@ extern "C" void forward(
     matmul<vocab_size, dim, GS>(out, xq.q, xq.s, w->wcls->q, w->wcls->s);
 }
 
-// Implementation of neural network building blocks
 template<int S>
 void rmsnorm(float o[S], float x[S], float weight[S]) {
+    #pragma HLS INLINE off
+
     // Calculate sum of squares
     float ss = 0.0f;
     
     sum_of_squares:
     for (int j = 0; j < S; j++) {
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off=true
+
         float x_j = x[j];
         ss += x_j * x_j;
     }
 
     ss /= S;
     ss += 1e-5f;
-    float inv_sqrt_ss = 1.0f / hls::sqrt(ss);   //seemingly no benefit
+    float inv_sqrt_ss = 1.0f / sqrtf(ss);
 
     norm_and_scale:
     for (int j = 0; j < S; j++) {
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off=true
+
         o[j] = weight[j] * (inv_sqrt_ss * x[j]);
     }
 }
 
 template<int MAXSIZE>
 void softmax(float *x, int size) {
+    #pragma HLS INLINE off
+
     // Find max value (for numerical stability)
     float max_val = x[0];
     
     max:
     for (int i = 1; i < size; i++) {
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off=true
+
         float x_i = x[i];
         if (x_i > max_val) {
             max_val = x_i;
@@ -259,8 +297,11 @@ void softmax(float *x, int size) {
     
     exp_and_sum:
     for (int i = 0; i < size; i++) {
-        float x_i = hls::exp(x[i] - max_val);   //unkown benefti
-        x[i] = x_i;  // Store back directly
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off=true
+
+        float x_i = expf(x[i] - max_val);
+        x[i] = x_i;
         sum += x_i;
     }
 
@@ -269,24 +310,40 @@ void softmax(float *x, int size) {
     
     norm:
     for (int i = 0; i < size; i++) {
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off=true
+
         x[i] = x[i] * inv_sum;
     }
 }
 
 template<int D, int N, int GS>
 void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
+    #pragma HLS INLINE off
+
     // W (d,n) @ x (n,) -> xout (d,)
     // Quantized matrix multiplication
-    
+    outer_matmul:
     for (int i = 0; i < D; i++) {
+        #pragma HLS PIPELINE off
+        #pragma HLS UNROLL off=true
+
         float val = 0.0f;
         
         // Do the matmul in groups of GS
+        inner_matmul:
         for (int j = 0; j <= N - GS; j += GS) {
+            #pragma HLS PIPELINE off
+            #pragma HLS UNROLL off=true
+
             int32_t ival = 0;
             
             // Inner product for this group
+            grouped_dot:
             for (int k = 0; k < GS; k++) {
+                #pragma HLS PIPELINE off
+                #pragma HLS UNROLL off=true
+
                 ival += ((int32_t)xq[j + k]) * ((int32_t)wq[i * N + j + k]);
             }
             

@@ -1,6 +1,7 @@
 # Ignore build artifacts, temp files, and logs
 HLS_link*
 HLS_synth*
+base*
 deploy/*
 .ipcache
 
