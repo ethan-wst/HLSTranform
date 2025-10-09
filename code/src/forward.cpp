@@ -2,6 +2,7 @@
 #include "config.h"
 #include <cstring>
 #include <cmath>
+#include <hls_math.h>
 
 // Main forward function with minimal interface pragmas
 extern "C" void forward(
@@ -46,7 +47,7 @@ extern "C" void forward(
 
     // Pre-compute reciprocals for frequent divisions
     static const float inv_head_size = 1.0f / float(head_size);
-    static const float inv_sqrt_head_size = 1.0f / sqrtf(float(head_size));
+    static const float inv_sqrt_head_size = 1.0f / hls::sqrtf(float(head_size));
     constexpr float inv_10000 = 1.0f / 10000.0f;
         
     // Access transformer weights
@@ -77,10 +78,10 @@ extern "C" void forward(
             #pragma HLS UNROLL off=true
 
             int head_dim = i % head_size;
-            float freq = powf(inv_10000, head_dim * inv_head_size);
+            float freq = hls::powf(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = hls::cosf(val);
+            float fci = hls::sinf(val);
             
             // Rotate the query vector
             float v0_q = q[i];
@@ -101,10 +102,10 @@ extern "C" void forward(
             #pragma HLS PIPELINE off
             #pragma HLS UNROLL off=true
             int head_dim = i % head_size;
-            float freq = powf(inv_10000, head_dim * inv_head_size);
+            float freq = hls::powf(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = hls::cosf(val);
+            float fci = hls::sinf(val);
             
             // Rotate only the query vector
             float v0 = q[i];
@@ -217,7 +218,7 @@ extern "C" void forward(
             float val = hb[i];
 
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            float exp_neg_val = expf(-val);
+            float exp_neg_val = hls::expf(-val);
             val *= (1.0f / (1.0f + exp_neg_val));
 
             // elementwise multiply with w3(x)
@@ -263,7 +264,7 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
 
     ss /= S;
     ss += 1e-5f;
-    float inv_sqrt_ss = 1.0f / sqrtf(ss);
+    float inv_sqrt_ss = 1.0f / hls::sqrtf(ss);
 
     norm_and_scale:
     for (int j = 0; j < S; j++) {
@@ -300,7 +301,7 @@ void softmax(float *x, int size) {
         #pragma HLS PIPELINE off
         #pragma HLS UNROLL off=true
 
-        float x_i = expf(x[i] - max_val);
+        float x_i = hls::expf(x[i] - max_val);
         x[i] = x_i;
         sum += x_i;
     }
