@@ -13,3 +13,4 @@ deploy/*
 
 # Compile outputs
 _x/
+*.sh 

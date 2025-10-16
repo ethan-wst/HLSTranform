@@ -1,0 +1,1 @@
+set_param general.maxMemoryUsage 24000

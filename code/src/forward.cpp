@@ -18,19 +18,19 @@ extern "C" void forward(
     #pragma HLS INLINE off
 
     // Interface pragmas
-    #pragma HLS INTERFACE m_axi port=transformer offset=slave
-    #pragma HLS INTERFACE m_axi port=key_cache offset=slave
-    #pragma HLS INTERFACE m_axi port=value_cache offset=slave
-    #pragma HLS INTERFACE m_axi port=out offset=slave
+    #pragma HLS INTERFACE m_axi port=transformer offset=slave max_read_burst_length=256 max_write_burst_length=256
+    #pragma HLS INTERFACE m_axi port=key_cache offset=slave max_read_burst_length=256 max_write_burst_length=256
+    #pragma HLS INTERFACE m_axi port=value_cache offset=slave max_read_burst_length=256 max_write_burst_length=256
+    #pragma HLS INTERFACE m_axi port=out offset=slave max_read_burst_length=256 max_write_burst_length=256
     // Control interface for scalars
     #pragma HLS INTERFACE s_axilite port=token
     #pragma HLS INTERFACE s_axilite port=pos
     #pragma HLS INTERFACE s_axilite port=return
     
     // Static arrays
-    static float x[dim];                                                    // activation at current time stamp (dim)
-    static float xb[dim];                                                   // same, but inside a residual branch (dim)
-    static float xb2[dim];                                                  // an additional buffer just for convenience (dim)
+    static float x[dim];                                                    // primary input (dim)
+    static float xb[dim];                                                   // input buffer (dim)
+    static float xb2[dim];                                                  // additional input buffer for convenience (dim)
     static float hb[hidden_dim];                                            // buffer for hidden dimension in the ffn (hidden_dim)
     static float hb2[hidden_dim];                                           // buffer for hidden dimension in the ffn (hidden_dim)
     static QuantizedTensor<dim> xq;                                         // quantized x (dim)
@@ -38,7 +38,25 @@ extern "C" void forward(
     static float q[dim];                                                    // query (dim)
     static float k[(dim * n_kv_heads) / n_heads];                           // key (dim)
     static float v[(dim * n_kv_heads) / n_heads];                           // value (dim)
-    static float att[n_heads * seq_len];                                    // buffer for scores/attention values (n_heads, seq_len)
+    static float att[n_heads * seq_len];       
+    
+    constexpr int UNROLL_FACTOR = 16;
+
+    // Array Partitioning pragmas
+    #pragma HLS ARRAY_PARTITION variable=x type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=xb type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=xb2 type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=hb type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=hb2 type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=q type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=k type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=v type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=att type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=xq.q type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=xq.s type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=hq.q type=cyclic factor=UNROLL_FACTOR
+    #pragma HLS ARRAY_PARTITION variable=hq.s type=cyclic factor=UNROLL_FACTOR
+
     
     // Key constants
     constexpr int kv_dim = (dim * n_kv_heads) / n_heads;                    // dimension of key/value vectors
@@ -53,9 +71,12 @@ extern "C" void forward(
     // Access transformer weights
     auto w = &transformer->weights;
     
-    // Copy the token embedding into x
-    std::memcpy(x, w->token_embedding_table + token * dim, dim * sizeof(float));
-    
+    // Copies token embedding table from HBM to local memory
+    for (int i = 0; i < dim; i++) {
+        #pragma HLS PIPELINE II=1
+        x[i] = w->token_embedding_table[token * dim + i];
+    }
+        
     main_forward_loop:
     for (int l = 0; l < n_layers; l++) {
         // Disable automatic loop optimizations
@@ -66,7 +87,7 @@ extern "C" void forward(
         rmsnorm<dim>(xb, x, w->rms_att_weight + l * dim);
         
         // QKV matmuls for this position
-        quantize<dim>(&xq, xb, GS);
+        quantize<dim, GS>(&xq, xb);
         matmul<dim, dim, GS>(q, xq.q, xq.s, (w->wq + l)->q, (w->wq + l)->s);
         matmul<kv_dim, dim, GS>(k, xq.q, xq.s, (w->wk + l)->q, (w->wk + l)->s);
         matmul<kv_dim, dim, GS>(v, xq.q, xq.s, (w->wv + l)->q, (w->wv + l)->s);
@@ -186,7 +207,7 @@ extern "C" void forward(
         }
 
         // Final matmul to get the output of the attention
-        quantize<dim>(&xq, xb, GS);
+        quantize<dim, GS>(&xq, xb);
         matmul<dim, dim, GS>(xb2, xq.q, xq.s, (w->wo + l)->q, (w->wo + l)->s);
         
         // Residual connection back into x
@@ -203,7 +224,7 @@ extern "C" void forward(
         
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // First calculate self.w1(x) and self.w3(x)
-        quantize<dim>(&xq, xb, GS);
+        quantize<dim, GS>(&xq, xb);
         matmul<hidden_dim, dim, GS>(hb, xq.q, xq.s, (w->w1 + l)->q, (w->w1 + l)->s);
         matmul<hidden_dim, dim, GS>(hb2, xq.q, xq.s, (w->w3 + l)->q, (w->w3 + l)->s);
         
@@ -228,7 +249,7 @@ extern "C" void forward(
         
         std::memcpy(hb, hb_out, hidden_dim * sizeof(float));
 
-        quantize<hidden_dim>(&hq, hb, GS);
+        quantize<hidden_dim, GS>(&hq, hb);
         matmul<dim, hidden_dim, GS>(xb, hq.q, hq.s, (w->w2 + l)->q, (w->w2 + l)->s);
         
         residual2:
@@ -242,7 +263,7 @@ extern "C" void forward(
     rmsnorm<dim>(x, x, w->rms_final_weight);
     
     // Classifier into logits
-    quantize<dim>(&xq, x, GS);
+    quantize<dim, GS>(&xq, x);
     matmul<vocab_size, dim, GS>(out, xq.q, xq.s, w->wcls->q, w->wcls->s);
 }
 
@@ -252,12 +273,23 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
 
     // Calculate sum of squares
     float ss = 0.0f;
-    
+
+    // Buffers, required for array partitioning
+    float weight_buffer[S];
+
+    // Partition factor should be equal to unrolling factor's below
+    #pragma HLS array_partition variable=weight_buffer type=cyclic factor=32
+
+    // Weight is stored on HBM
+    burst_copy_rms_w:
+    for (int i = 0; i < S; i++) {
+        #pragma HLS PIPELINE II=1
+
+        weight_buffer[i] = weight[i];
+    }
+
     sum_of_squares:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off=true
-
         float x_j = x[j];
         ss += x_j * x_j;
     }
@@ -268,39 +300,36 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
 
     norm_and_scale:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off=true
+        #pragma HLS PIPELINE II=1
+        #pragma HLS UNROLL factor=16 skip_exit_check
 
-        o[j] = weight[j] * (inv_sqrt_ss * x[j]);
+        o[j] = weight_buffer[j] * (inv_sqrt_ss * x[j]);
     }
 }
 
+// Size is dependent on position in input sequence, may vary 1-1024; MAXSIZE
+// Percieved no need for buffer as *x is stored in BRAM/URAM
 template<int MAXSIZE>
 void softmax(float *x, int size) {
     #pragma HLS INLINE off
 
-    // Find max value (for numerical stability)
     float max_val = x[0];
     
+    // Loop-carried dependency (maxsize)
+    // Potential future optimization (non-critical)
     max:
     for (int i = 1; i < size; i++) {
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off=true
-
         float x_i = x[i];
         if (x_i > max_val) {
             max_val = x_i;
         }
     }
     
-    // Exp and sum
     float sum = 0.0f;
     
+    // Reduction dependency (sum)
     exp_and_sum:
     for (int i = 0; i < size; i++) {
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off=true
-
         float x_i = hls::expf(x[i] - max_val);
         x[i] = x_i;
         sum += x_i;
@@ -311,8 +340,8 @@ void softmax(float *x, int size) {
     
     norm:
     for (int i = 0; i < size; i++) {
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off=true
+        #pragma HLS PIPELINE II = 1
+        #pragma HLS UNROLL factor = 16
 
         x[i] = x[i] * inv_sum;
     }
@@ -322,28 +351,31 @@ template<int D, int N, int GS>
 void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
     #pragma HLS INLINE off
 
+    #pragma HLS INTERFACE m_axi port=xq offset=slave bundle=gmem0 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=xs offset=slave bundle=gmem1 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=wq offset=slave bundle=gmem2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=ws offset=slave bundle=gmem3 max_read_burst_length=64
+    #pragma HLS INTERFACE m_axi port=xout offset=slave bundle=gmem4 max_write_burst_length=64
+
     // W (d,n) @ x (n,) -> xout (d,)
     // Quantized matrix multiplication
     outer_matmul:
     for (int i = 0; i < D; i++) {
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off=true
+        #pragma HLS PIPELINE
 
         float val = 0.0f;
         
         // Do the matmul in groups of GS
         inner_matmul:
         for (int j = 0; j <= N - GS; j += GS) {
-            #pragma HLS PIPELINE off
-            #pragma HLS UNROLL off=true
+            #pragma HLS UNROLL factor=4 skip_exit_check
 
             int32_t ival = 0;
             
             // Inner product for this group
             grouped_dot:
             for (int k = 0; k < GS; k++) {
-                #pragma HLS PIPELINE off
-                #pragma HLS UNROLL off=true
+                #pragma HLS UNROLL
 
                 ival += ((int32_t)xq[j + k]) * ((int32_t)wq[i * N + j + k]);
             }
