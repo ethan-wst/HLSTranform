@@ -4,99 +4,166 @@
 #include <cmath>
 #include <hls_math.h>
 
-// Main forward function with minimal interface pragmas
+// Top-level forward function with flattened weight interface
+// All weights passed as individual pointers mapped to separate HBM banks
+
 extern "C" void forward(
-    Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *transformer,
-    int token, 
-    int pos, 
-    float key_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], 
-    float value_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], 
-    float *out
+    // Embedding weights
+    float *token_embedding_table,
+    
+    // Attention weights
+    int8_t *wq_weights,
+    float *wq_scales,
+    int8_t *wk_weights,
+    float *wk_scales,
+    int8_t *wv_weights,
+    float *wv_scales,
+    int8_t *wo_weights,
+    float *wo_scales,
+    
+    // FFN weights
+    int8_t *w1_weights,
+    float *w1_scales,
+    int8_t *w2_weights,
+    float *w2_scales,
+    int8_t *w3_weights,
+    float *w3_scales,
+    
+    // RMS norm weights
+    float *rms_att_weight,
+    float *rms_ffn_weight,
+    float *rms_final_weight,
+    
+    // Classifier weights
+    int8_t *wcls_weights,
+    float *wcls_scales,
+    
+    // KV cache
+    float *key_cache,
+    float *value_cache,
+    
+    // Output
+    float *out,
+    
+    // Control parameters
+    int token,
+    int pos,
 ) {
 
-    // Disable automatic inlining 
-    #pragma HLS INLINE off
-
-    // Interface pragmas
-    #pragma HLS INTERFACE m_axi port=transformer offset=slave max_read_burst_length=256 max_write_burst_length=256
-    #pragma HLS INTERFACE m_axi port=key_cache offset=slave max_read_burst_length=256 max_write_burst_length=256
-    #pragma HLS INTERFACE m_axi port=value_cache offset=slave max_read_burst_length=256 max_write_burst_length=256
-    #pragma HLS INTERFACE m_axi port=out offset=slave max_read_burst_length=256 max_write_burst_length=256
-    // Control interface for scalars
-    #pragma HLS INTERFACE s_axilite port=token
-    #pragma HLS INTERFACE s_axilite port=pos
-    #pragma HLS INTERFACE s_axilite port=return
+    // ========== M_AXI Interfaces - Separate HBM Banks ==========
+    // Embedding
+    #pragma HLS INTERFACE m_axi port=token_embedding_table offset=slave depth=24576000 bundle=gmem0 max_read_burst_length=256
     
-    // Static arrays
-    static float x[dim];                                                    // primary input (dim)
-    static float xb[dim];                                                   // input buffer (dim)
-    static float xb2[dim];                                                  // additional input buffer for convenience (dim)
-    static float hb[hidden_dim];                                            // buffer for hidden dimension in the ffn (hidden_dim)
-    static float hb2[hidden_dim];                                           // buffer for hidden dimension in the ffn (hidden_dim)
-    static QuantizedTensor<dim> xq;                                         // quantized x (dim)
-    static QuantizedTensor<hidden_dim> hq;                                  // quantized hb (hidden_dim)
-    static float q[dim];                                                    // query (dim)
-    static float k[(dim * n_kv_heads) / n_heads];                           // key (dim)
-    static float v[(dim * n_kv_heads) / n_heads];                           // value (dim)
-    static float att[n_heads * seq_len];       
+    // Attention weights
+    #pragma HLS INTERFACE m_axi port=wq_weights offset=slave depth=7077888 bundle=gmem1 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wq_scales offset=slave depth=110592 bundle=gmem2 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wk_weights offset=slave depth=7077888 bundle=gmem3 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wk_scales offset=slave depth=110592 bundle=gmem4 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wv_weights offset=slave depth=7077888 bundle=gmem5 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wv_scales offset=slave depth=110592 bundle=gmem6 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wo_weights offset=slave depth=7077888 bundle=gmem7 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wo_scales offset=slave depth=110592 bundle=gmem8 max_read_burst_length=256
     
-    constexpr int UNROLL_FACTOR = 16;
-
-    // Array Partitioning pragmas
-    #pragma HLS ARRAY_PARTITION variable=x type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=xb type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=xb2 type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=hb type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=hb2 type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=q type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=k type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=v type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=att type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=xq.q type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=xq.s type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=hq.q type=cyclic factor=UNROLL_FACTOR
-    #pragma HLS ARRAY_PARTITION variable=hq.s type=cyclic factor=UNROLL_FACTOR
-
+    // FFN weights
+    #pragma HLS INTERFACE m_axi port=w1_weights offset=slave depth=18874368 bundle=gmem9 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w1_scales offset=slave depth=294912 bundle=gmem10 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w2_weights offset=slave depth=18874368 bundle=gmem11 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w2_scales offset=slave depth=294912 bundle=gmem12 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w3_weights offset=slave depth=18874368 bundle=gmem13 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=w3_scales offset=slave depth=294912 bundle=gmem14 max_read_burst_length=256
     
-    // Key constants
-    constexpr int kv_dim = (dim * n_kv_heads) / n_heads;                    // dimension of key/value vectors
-    constexpr int kv_mul = n_heads / n_kv_heads;                            // integer multiplier of the kv sharing in multiquery
-    constexpr int head_size = dim / n_heads;                                // dimension of each attention head
+    // RMS norm weights
+    #pragma HLS INTERFACE m_axi port=rms_att_weight offset=slave depth=9216 bundle=gmem15 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=rms_ffn_weight offset=slave depth=9216 bundle=gmem16 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=rms_final_weight offset=slave depth=768 bundle=gmem17 max_read_burst_length=256
+    
+    // Classifier weights
+    #pragma HLS INTERFACE m_axi port=wcls_weights offset=slave depth=24576000 bundle=gmem18 max_read_burst_length=256
+    #pragma HLS INTERFACE m_axi port=wcls_scales offset=slave depth=384000 bundle=gmem19 max_read_burst_length=256
+    
+    // KV cache
+    #pragma HLS INTERFACE m_axi port=key_cache offset=slave depth=9437184 bundle=gmem20 max_read_burst_length=256 max_write_burst_length=256
+    #pragma HLS INTERFACE m_axi port=value_cache offset=slave depth=9437184 bundle=gmem21 max_read_burst_length=256 max_write_burst_length=256
+    
+    // Output
+    #pragma HLS INTERFACE m_axi port=out offset=slave depth=32000 bundle=gmem22 max_write_burst_length=256
+    
+    // ========== AXI-Lite Control Interface ==========
+    #pragma HLS INTERFACE s_axilite port=token bundle=control
+    #pragma HLS INTERFACE s_axilite port=pos bundle=control
+    #pragma HLS INTERFACE s_axilite port=return bundle=control
+
+
+    // ====================== LOCAL ARRAYS ========================
+
+    constexpr int kv_dim = (dim * n_kv_heads) / n_heads;    // dimension of key/value vectors
+    constexpr int head_size = dim / n_heads;                // dimension of each attention head
+
+    // Main activation buffers
+     float x[dim];                    // Current activation
+    float xb[dim];                   // Intermediate buffer 1
+    float xb2[dim];                  // Intermediate buffer 2
+    float hb[hidden_dim];            // Hidden layer buffer
+    float hb2[hidden_dim];           // Hidden layer buffer 2
+    float q[dim];                    // Query
+    float k[kv_dim];                 // Key
+    float v[kv_dim];                 // Value
+    float att[n_heads * seq_len];    // Attention scores     
+    
+    // Quantized tensors
+    QuantizedTensor<dim> xq;
+    QuantizedTensor<hidden_dim> hq;
+    
+    // TODO: Add array partitioning pragmas based on resource availability                         // dimension of each attention head
+
+    // ================= FORWARD PASS PREPERATION =================
 
     // Pre-compute reciprocals for frequent divisions
     static const float inv_head_size = 1.0f / float(head_size);
     static const float inv_sqrt_head_size = 1.0f / hls::sqrtf(float(head_size));
     constexpr float inv_10000 = 1.0f / 10000.0f;
-        
-    // Access transformer weights
-    auto w = &transformer->weights;
-    
-    // Copies token embedding table from HBM to local memory
+
+    load_embedding:
     for (int i = 0; i < dim; i++) {
         #pragma HLS PIPELINE II=1
-        x[i] = w->token_embedding_table[token * dim + i];
+        x[i] = token_embedding_table[token * dim + i];
     }
+
+    // ================= FORWARD PASS COMPUTATION =================
+    // NOTE: This still contains inline computation (Critical Issue #2)
+    //       For dataflow optimization, extract these into separate functions
         
     main_forward_loop:
     for (int l = 0; l < n_layers; l++) {
-        // Disable automatic loop optimizations
-        #pragma HLS PIPELINE off
-        #pragma HLS UNROLL off
+        #pragma HLS LOOP_TRIPCOUNT min=12 max=12
+
+        // Calculate layer-specific offsets for weight access
+        const int dim_dim_offset = l * dim * dim;
+        const int dim_kv_offset = l * dim * kv_dim;
+        const int dim_hidden_offset = l * dim * hidden_dim;
+        const int hidden_dim_offset = l * hidden_dim * dim;
+        const int rms_offset = l * dim;
+        const int kv_cache_offset = l * seq_len * kv_dim;
         
-        // Attention rmsnorm
-        rmsnorm<dim>(xb, x, w->rms_att_weight + l * dim);
+        // TODO: Extract for dataflow
+        // ===================== ATTENTION BLOCK =====================
+
+        // Step 1: Attention RMSnorm
+        rmsnorm<dim>(xb, x, &rms_att_weight[rms_offset]);
         
-        // QKV matmuls for this position
-        quantize<dim, GS>(&xq, xb);
-        matmul<dim, dim, GS>(q, xq.q, xq.s, (w->wq + l)->q, (w->wq + l)->s);
-        matmul<kv_dim, dim, GS>(k, xq.q, xq.s, (w->wk + l)->q, (w->wk + l)->s);
-        matmul<kv_dim, dim, GS>(v, xq.q, xq.s, (w->wv + l)->q, (w->wv + l)->s);
+        // Step 2: Quantize for attention
+        quantize<dim>(&xq, xb);
         
-        // RoPE
+        // Step 3: QKV projections (using layer-specific weights)
+        matmul<dim, dim>(q, xq.q, xq.s, &wq_weights[dim_dim_offset], &wq_scales[dim_dim_offset / GS]);
+        matmul<kv_dim, dim>(k, xq.q, xq.s, &wk_weights[dim_kv_offset], &wk_scales[dim_kv_offset / GS]);
+        matmul<kv_dim, dim>(v, xq.q, xq.s, &wv_weights[dim_kv_offset], &wv_scales[dim_kv_offset / GS]);
+        
+        // Step 4: RoPE rotation
+        // TODO: Extract for dataflow
         rotation1:
         for (int i = 0; i < kv_dim; i += 2) {
-            #pragma HLS PIPELINE off
-            #pragma HLS UNROLL off=true
+            #pragma HLS PIPELINE II=1
 
             int head_dim = i % head_size;
             float freq = hls::powf(inv_10000, head_dim * inv_head_size);
@@ -120,8 +187,8 @@ extern "C" void forward(
         rotation2:
         // Rotation for only the query vector (i >= kv_dim)
         for (int i = kv_dim; i < dim; i += 2) {
-            #pragma HLS PIPELINE off
-            #pragma HLS UNROLL off=true
+            #pragma HLS PIPELINE II=1
+
             int head_dim = i % head_size;
             float freq = hls::powf(inv_10000, head_dim * inv_head_size);
             float val = pos * freq;
@@ -135,137 +202,132 @@ extern "C" void forward(
             q[i + 1] = v0 * fci + v1 * fcr;
         }
         
-        // Save key,value at this time step (pos) to our kv cache
-        int loff = l * seq_len * kv_dim;
-        float *key_cache_row = key_cache + loff + pos * kv_dim;
-        float *value_cache_row = value_cache + loff + pos * kv_dim;
-        std::memcpy(key_cache_row, k, kv_dim * sizeof(*key_cache_row));
-        std::memcpy(value_cache_row, v, kv_dim * sizeof(*value_cache_row));
+        // Step 5: Update KV cache
+        // TODO: Extract for dataflow
+        int kv_cache_pos_offset = kv_cache_offset + pos * kv_dim;
         
+        update_kv_k:
+        for (int i = 0; i < kv_dim; i++) {
+            #pragma HLS PIPELINE II=1
+            key_cache[kv_cache_pos_offset + i] = k[i];
+        }
+        
+        update_kv_v:
+        for (int i = 0; i < kv_dim; i++) {
+            #pragma HLS PIPELINE II=1
+            value_cache[kv_cache_pos_offset + i] = v[i];
+        }
+        
+
+        // Step 6: Multi-head attention
+        // TODO: Extract for dataflow
         multihead_attention:
         for (int h = 0; h < n_heads; h++) {
             #pragma HLS PIPELINE off
             #pragma HLS UNROLL off=true
 
-            // Get the query vector for this head
-            const int q_offset = h * head_size;
+            float *q_head = q + h * head_size;
+            float *att_head = att + h * seq_len;
             
-            // Attention scores for this head
-            const int att_offset = h * seq_len;
-            
-            // Iterate over all timesteps, including the current one
-            iterate:
+            // Compute attention scores for this head
+            att_scores:
             for (int t = 0; t <= pos; t++) {
-                #pragma HLS PIPELINE off
-                #pragma HLS UNROLL off=true
-
-                // Get the key vector for this head and at this timestep
-                const int key_offset = loff + t * kv_dim + (h / kv_mul) * head_size;
+                #pragma HLS PIPELINE II=1
+                int kv_head = h / (n_heads / n_kv_heads);
+                float *k_head = &key_cache[kv_cache_offset + t * kv_dim + kv_head * head_size];
                 
-                // Calculate the attention score as the dot product of q and k
                 float score = 0.0f;
-                attention_dot:
                 for (int i = 0; i < head_size; i++) {
-                    #pragma HLS PIPELINE off
-                    #pragma HLS UNROLL off=true
-
-                    score += q[i + q_offset] * key_cache[i + key_offset];
+                    score += q_head[i] * k_head[i];
                 }
-                score *= inv_sqrt_head_size;  // Scale the score
-                
-                // Save the score to the attention buffer
-                att[t + att_offset] = score;
+                att_head[t] = score / hls::sqrt((float)head_size);
             }
             
-            // Softmax the scores to get attention weights, from 0..pos inclusively - FIXED: Added template parameter
-            softmax<seq_len>(att + att_offset, pos + 1);
+            // Softmax over attention scores            
+            softmax<seq_len>(att_head, pos + 1);
             
-            // Weighted sum of the values, store back into xb
-            const int xb_offset = h * head_size;
-            memset(xb + xb_offset, 0, head_size * sizeof(float));
-            
-            acc:
+            // Weighted sum of the values
+            float *xb_head = xb + h * head_size;
+
+            init_xb:
+            for (int i = 0; i < head_size; i++) {
+                #pragma HLS PIPELINE II=1
+                xb_head[i] = 0.0f;
+            }
+
+            att_weighted_sum:
             for (int t = 0; t <= pos; t++) {
                 #pragma HLS PIPELINE off
-                #pragma HLS UNROLL off=true
-
-                // Get the value vector for this head and at this timestep
-                const int v_offset = loff + t * kv_dim + (h / kv_mul) * head_size;
+                int kv_head = h / (n_heads / n_kv_heads);
+                float *v_head = &value_cache[kv_cache_offset + t * kv_dim + kv_head * head_size];
+                float a = att_head[t];
                 
-                // Get the attention weight for this timestep
-                float a = att[t + att_offset];
-                
-                // Accumulate the weighted value into xb
-                acc_inner:
                 for (int i = 0; i < head_size; i++) {
-                    #pragma HLS PIPELINE off
-                    #pragma HLS UNROLL off=true
-
-                    xb[i + xb_offset] += a * value_cache[i + v_offset];
+                    #pragma HLS PIPELINE II=1
+                    xb_head[i] += a * v_head[i];
                 }
             }
         }
 
-        // Final matmul to get the output of the attention
+        // Step 7: Output projection
         quantize<dim, GS>(&xq, xb);
-        matmul<dim, dim, GS>(xb2, xq.q, xq.s, (w->wo + l)->q, (w->wo + l)->s);
+        matmul<dim, dim>(xb2, xq.q, xq.s, &wo_weights[dim_dim_offset], &wo_scales[dim_dim_offset / GS]);
         
-        // Residual connection back into x
-        residual:
+        // Step 8: Residual Connection (attention)
+        // TODO: Extract for dataflow
+        residual_att:
         for (int i = 0; i < dim; i++) {
-            #pragma HLS PIPELINE off
-            #pragma HLS UNROLL off=true
+            #pragma HLS PIPELINE II=1
 
             x[i] += xb2[i];
         }
 
-        // FFN rmsnorm
-        rmsnorm<dim>(xb, x, w->rms_ffn_weight + l * dim);
-        
-        // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-        // First calculate self.w1(x) and self.w3(x)
-        quantize<dim, GS>(&xq, xb);
-        matmul<hidden_dim, dim, GS>(hb, xq.q, xq.s, (w->w1 + l)->q, (w->w1 + l)->s);
-        matmul<hidden_dim, dim, GS>(hb2, xq.q, xq.s, (w->w3 + l)->q, (w->w3 + l)->s);
-        
-        float hb_out[hidden_dim];
+        // ===================== FFN BLOCK =====================
+
+        // Step 9: FFN RMSnorm
+        rmsnorm<dim>(xb, x, &rms_ffn_weight[rms_offset]);
+
+        // Step 10: FFN forward
+        // TODO (Issue #2): Extract to separate function for dataflow
+        quantize<dim>(&xq, xb);
+
+        // w1 and w3 projections (for SwiGLU)
+        matmul<hidden_dim, dim>(hb, xq.q, xq.s, &w1_weights[dim_hidden_offset], &w1_scales[dim_hidden_offset / GS]);
+        matmul<hidden_dim, dim>(hb2, xq.q, xq.s, &w3_weights[dim_hidden_offset], &w3_scales[dim_hidden_offset / GS]);
         
         // SwiGLU activation: silu(x) = x * sigmoid(x)
         swi_glu:
         for (int i = 0; i < hidden_dim; i++) {
-            #pragma HLS PIPELINE off
-            #pragma HLS UNROLL off=true
+            #pragma HLS PIPELINE II=1
 
             float val = hb[i];
-
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            float exp_neg_val = hls::expf(-val);
-            val *= (1.0f / (1.0f + exp_neg_val));
-
-            // elementwise multiply with w3(x)
+            val *= (1.0f / (1.0f + hls::expf(-val)));
             val *= hb2[i];
-            hb_out[i] = val;
+            hb[i] = val;
         }
         
-        std::memcpy(hb, hb_out, hidden_dim * sizeof(float));
-
-        quantize<hidden_dim, GS>(&hq, hb);
-        matmul<dim, hidden_dim, GS>(xb, hq.q, hq.s, (w->w2 + l)->q, (w->w2 + l)->s);
+        quantize<hidden_dim>(&hq, hb);
+        matmul<dim, hidden_dim>(xb, hq.q, hq.s, &w2_weights[hidden_dim_offset], &w2_scales[hidden_dim_offset / GS]);
         
-        residual2:
+        // Step 11: Residual connection (FFN)
+        residual_ffn:
         for (int i = 0; i < dim; i++) {
-            #pragma HLS PIPELINE off
-            #pragma HLS UNROLL off=true
+            #pragma HLS PIPELINE II=1
             x[i] += xb[i];
         }
-    }
-    
-    rmsnorm<dim>(x, x, w->rms_final_weight);
-    
-    // Classifier into logits
+    } // End of main_forward_loop
+
+    // ==================== FINAL LAYER PROCESSING ======================
+    // Final RMSnorm
+    rmsnorm<dim>(x, x, rms_final_weight);
+
+    // Classifier
     quantize<dim, GS>(&xq, x);
-    matmul<vocab_size, dim, GS>(out, xq.q, xq.s, w->wcls->q, w->wcls->s);
+    matmul<vocab_size, dim, GS>(out, xq.q, xq.s, wcls_weights, wcls_scales);
 }
+
+
+// ========================== HELPER FUNCTION ==========================
 
 template<int S>
 void rmsnorm(float o[S], float x[S], float weight[S]) {
@@ -274,123 +336,79 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
     // Calculate sum of squares
     float ss = 0.0f;
 
-    // Buffers, required for array partitioning
-    float weight_buffer[S];
-
-    // Partition factor should be equal to unrolling factor's below
-    #pragma HLS array_partition variable=weight_buffer type=cyclic factor=32
-
-    // Weight is stored on HBM
-    burst_copy_rms_w:
-    for (int i = 0; i < S; i++) {
-        #pragma HLS PIPELINE II=1
-
-        weight_buffer[i] = weight[i];
-    }
-
-    sum_of_squares:
+    sum_squares:
     for (int j = 0; j < S; j++) {
-        float x_j = x[j];
-        ss += x_j * x_j;
+        #pragma HLS PIPELINE II=1
+        ss += x[j] * x[j];
     }
-
     ss /= S;
     ss += 1e-5f;
-    float inv_sqrt_ss = 1.0f / hls::sqrtf(ss);
-
-    norm_and_scale:
+    ss = 1.0f / hls::sqrt(ss);
+    
+    // Normalize and scale
+    normalize:
     for (int j = 0; j < S; j++) {
         #pragma HLS PIPELINE II=1
-        #pragma HLS UNROLL factor=16 skip_exit_check
-
-        o[j] = weight_buffer[j] * (inv_sqrt_ss * x[j]);
+        o[j] = weight[j] * (ss * x[j]);
     }
 }
 
-// Size is dependent on position in input sequence, may vary 1-1024; MAXSIZE
-// Percieved no need for buffer as *x is stored in BRAM/URAM
+// TODO: Look into find_max/exp_sum reduction and loop-carried dependency optimizations
 template<int MAXSIZE>
 void softmax(float *x, int size) {
     #pragma HLS INLINE off
 
+    // Find max
     float max_val = x[0];
-    
-    // Loop-carried dependency (maxsize)
-    // Potential future optimization (non-critical)
-    max:
+    find_max:
     for (int i = 1; i < size; i++) {
-        float x_i = x[i];
-        if (x_i > max_val) {
-            max_val = x_i;
-        }
+        #pragma HLS PIPELINE II=1
+        if (x[i] > max_val) max_val = x[i];
     }
     
+    // Exp and sum
     float sum = 0.0f;
-    
-    // Reduction dependency (sum)
-    exp_and_sum:
+    exp_sum:
     for (int i = 0; i < size; i++) {
-        float x_i = hls::expf(x[i] - max_val);
-        x[i] = x_i;
-        sum += x_i;
+        #pragma HLS PIPELINE II=1
+        x[i] = hls::expf(x[i] - max_val);
+        sum += x[i];
     }
-
-    // Normalize
-    const float inv_sum = 1.0f / sum;
     
-    norm:
+    // Normalize
+    normalize:
     for (int i = 0; i < size; i++) {
-        #pragma HLS PIPELINE II = 1
-        #pragma HLS UNROLL factor = 16
-
-        x[i] = x[i] * inv_sum;
+        #pragma HLS PIPELINE II=1
+        x[i] /= sum;
     }
 }
 
-template<int D, int N, int GS>
+// TODO: Optimize further, ensure optimizations are sound
+template<int D, int N>
 void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
     #pragma HLS INLINE off
 
-    #pragma HLS INTERFACE m_axi port=xq offset=slave bundle=gmem0 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=xs offset=slave bundle=gmem1 max_read_burst_length=64
-    #pragma HLS INTERFACE m_axi port=wq offset=slave bundle=gmem2 max_read_burst_length=256
-    #pragma HLS INTERFACE m_axi port=ws offset=slave bundle=gmem3 max_read_burst_length=64
-    #pragma HLS INTERFACE m_axi port=xout offset=slave bundle=gmem4 max_write_burst_length=64
-
-    // W (d,n) @ x (n,) -> xout (d,)
-    // Quantized matrix multiplication
-    outer_matmul:
+    outer:
     for (int i = 0; i < D; i++) {
         #pragma HLS PIPELINE
 
         float val = 0.0f;
         
-        // Do the matmul in groups of GS
-        inner_matmul:
+        inner:
         for (int j = 0; j <= N - GS; j += GS) {
             #pragma HLS UNROLL factor=4 skip_exit_check
 
             int32_t ival = 0;
             
-            // Inner product for this group
-            grouped_dot:
+            dot:
             for (int k = 0; k < GS; k++) {
                 #pragma HLS UNROLL
 
                 ival += ((int32_t)xq[j + k]) * ((int32_t)wq[i * N + j + k]);
             }
             
-            // Scale and accumulate
             val += ((float)ival) * ws[i * N / GS + j / GS] * xs[j / GS];
         }
         xout[i] = val;
     }
 }
-
-// Explicit template instantiations for HLS
-template void rmsnorm<dim>(float o[dim], float x[dim], float weight[dim]);
-template void rmsnorm<hidden_dim>(float o[hidden_dim], float x[hidden_dim], float weight[hidden_dim]);
-template void softmax<seq_len>(float *x, int size);
-template void matmul<dim, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
-template void matmul<hidden_dim, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
-template void matmul<vocab_size, dim, GS>(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws);
