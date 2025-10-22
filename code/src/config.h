@@ -1,6 +1,9 @@
 #pragma once
 #include "typedefs.h"
 
+
+// These values must match the checkpoint file being loaded.
+
 static constexpr int dim = 768;
 static constexpr int hidden_dim = 2048;
 static constexpr int n_layers = 12;

@@ -3,11 +3,6 @@
 
 // TODO: replace with HLS types (vector, int, fp, etc...)
 
-//===========================================================================
-//  typedefs.h
-//===========================================================================
-//  @brief: This header defines the shorthand of several ap_uint data types.
-
 #ifndef TYPEDEFS
 #define TYPEDEFS
 
