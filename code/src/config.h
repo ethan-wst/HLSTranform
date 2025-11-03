@@ -13,6 +13,9 @@ static constexpr int vocab_size = 32000;
 static constexpr int seq_len = 1024;
 static constexpr int GS = 64;
 
+static constexpr int kv_dim = (dim * n_kv_heads) / n_heads;
+static constexpr int head_size = dim / n_heads;
+
 constexpr Config config = {
     .dim = dim,
     .hidden_dim = hidden_dim,

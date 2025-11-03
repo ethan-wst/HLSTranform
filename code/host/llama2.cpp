@@ -35,6 +35,39 @@ typedef struct
   int id;
 } TokenIndex;
 
+struct Weights {
+    // Embedding (dequantized for host use)
+    float *token_embedding_table;
+    
+    // Attention weights (quantized - keep in int8)
+    int8_t *wq_weights;
+    float *wq_scales;
+    int8_t *wk_weights;
+    float *wk_scales;
+    int8_t *wv_weights;
+    float *wv_scales;
+    int8_t *wo_weights;
+    float *wo_scales;
+    
+    // FFN weights (quantized)
+    int8_t *w1_weights;
+    float *w1_scales;
+    int8_t *w2_weights;
+    float *w2_scales;
+    int8_t *w3_weights;
+    float *w3_scales;
+    
+    // RMS norm weights (float)
+    float *rms_att_weight;
+    float *rms_ffn_weight;
+    float *rms_final_weight;
+    
+    // Classifier weights (quantized)
+    int8_t *wcls_weights;
+    float *wcls_scales;
+};
+
+
 // Structure to hold the tokenizer data
 typedef struct
 {
@@ -82,6 +115,97 @@ typedef struct {
   std::vector<long> story_first_token_latencies;
   std::vector<int> story_token_counts;
 } BenchmarkEval;
+
+// Bundle for device BOs
+struct DeviceBOs {
+    xrt::bo emb_bo;
+    xrt::bo wq_bo;   xrt::bo wq_s_bo;
+    xrt::bo wk_bo;   xrt::bo wk_s_bo;
+    xrt::bo wv_bo;   xrt::bo wv_s_bo;
+    xrt::bo wo_bo;   xrt::bo wo_s_bo;
+    xrt::bo w1_bo;   xrt::bo w1_s_bo;
+    xrt::bo w2_bo;   xrt::bo w2_s_bo;
+    xrt::bo w3_bo;   xrt::bo w3_s_bo;
+    xrt::bo rms_att_bo;
+    xrt::bo rms_ffn_bo;
+    xrt::bo rms_final_bo;
+    xrt::bo wcls_bo; xrt::bo wcls_s_bo;
+    xrt::bo key_bo;  xrt::bo value_bo;
+    xrt::bo out_bo;
+
+    DeviceBOs(xrt::device& dev, xrt::kernel& k,
+              size_t emb_bytes, size_t att_size, size_t att_scale_bytes,
+              size_t ffn1_size, size_t ffn1_scale_bytes,
+              size_t ffn2_size, size_t ffn2_scale_bytes,
+              size_t cls_size, size_t cls_scale_bytes, size_t cache_dim, size_t out_bytes)
+      : emb_bo(dev, emb_bytes, k.group_id(0)),
+        wq_bo(dev, att_size, k.group_id(1)), wq_s_bo(dev, att_scale_bytes, k.group_id(2)),
+        wk_bo(dev, att_size, k.group_id(3)), wk_s_bo(dev, att_scale_bytes, k.group_id(4)),
+        wv_bo(dev, att_size, k.group_id(5)), wv_s_bo(dev, att_scale_bytes, k.group_id(6)),
+        wo_bo(dev, att_size, k.group_id(7)), wo_s_bo(dev, att_scale_bytes, k.group_id(8)),
+        w1_bo(dev, ffn1_size, k.group_id(9)), w1_s_bo(dev, ffn1_scale_bytes, k.group_id(10)),
+        w2_bo(dev, ffn2_size, k.group_id(11)), w2_s_bo(dev, ffn2_scale_bytes, k.group_id(12)),
+        w3_bo(dev, ffn1_size, k.group_id(13)), w3_s_bo(dev, ffn1_scale_bytes, k.group_id(14)),
+        rms_att_bo(dev, n_layers * dim * sizeof(float), k.group_id(15)),
+        rms_ffn_bo(dev, n_layers * dim * sizeof(float), k.group_id(16)),
+        rms_final_bo(dev, dim * sizeof(float), k.group_id(17)),
+        wcls_bo(dev, cls_size, k.group_id(18)), wcls_s_bo(dev, cls_scale_bytes, k.group_id(19)),
+        key_bo(dev, cache_dim * sizeof(float), k.group_id(20)),
+        value_bo(dev, cache_dim * sizeof(float), k.group_id(21)),
+        out_bo(dev, out_bytes, k.group_id(22))
+    {}
+};
+
+// Allocate BOs, upload weights, zero caches
+DeviceBOs prepare_device_bos(xrt::device& device, xrt::kernel& kernel, Weights* weights) {
+    // compute sizes (must match forward.cpp assumptions)
+    size_t emb_bytes = (size_t)vocab_size * dim * sizeof(float);
+    size_t att_size = (size_t)n_layers * dim * dim;
+    size_t att_scale_bytes = (att_size / GS) * sizeof(float);
+    size_t ffn1_size = (size_t)n_layers * dim * hidden_dim;
+    size_t ffn1_scale_bytes = (ffn1_size / GS) * sizeof(float);
+    size_t ffn2_size = (size_t)n_layers * hidden_dim * dim;
+    size_t ffn2_scale_bytes = (ffn2_size / GS) * sizeof(float);
+    size_t cls_size = (size_t)vocab_size * dim;
+    size_t cls_scale_bytes = (cls_size / GS) * sizeof(float);
+    size_t cache_dim = (size_t)n_layers * seq_len * ((dim * n_kv_heads) / n_heads);
+    size_t out_bytes = (size_t)vocab_size * sizeof(float);
+
+    DeviceBOs bos(device, kernel,
+                  emb_bytes, att_size, att_scale_bytes,
+                  ffn1_size, ffn1_scale_bytes,
+                  ffn2_size, ffn2_scale_bytes,
+                  cls_size, cls_scale_bytes, cache_dim, out_bytes);
+
+    // write weights (order must match kernel arg mapping)
+    bos.emb_bo.write(weights->token_embedding_table, emb_bytes, 0); bos.emb_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wq_bo.write(weights->wq_weights, att_size, 0); bos.wq_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wq_s_bo.write(weights->wq_scales, att_scale_bytes, 0); bos.wq_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wk_bo.write(weights->wk_weights, att_size, 0); bos.wk_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wk_s_bo.write(weights->wk_scales, att_scale_bytes, 0); bos.wk_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wv_bo.write(weights->wv_weights, att_size, 0); bos.wv_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wv_s_bo.write(weights->wv_scales, att_scale_bytes, 0); bos.wv_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wo_bo.write(weights->wo_weights, att_size, 0); bos.wo_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wo_s_bo.write(weights->wo_scales, att_scale_bytes, 0); bos.wo_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.w1_bo.write(weights->w1_weights, ffn1_size, 0); bos.w1_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.w1_s_bo.write(weights->w1_scales, ffn1_scale_bytes, 0); bos.w1_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.w2_bo.write(weights->w2_weights, ffn2_size, 0); bos.w2_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.w2_s_bo.write(weights->w2_scales, ffn2_scale_bytes, 0); bos.w2_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.w3_bo.write(weights->w3_weights, ffn1_size, 0); bos.w3_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.w3_s_bo.write(weights->w3_scales, ffn1_scale_bytes, 0); bos.w3_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.rms_att_bo.write(weights->rms_att_weight, n_layers * dim * sizeof(float), 0); bos.rms_att_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.rms_ffn_bo.write(weights->rms_ffn_weight, n_layers * dim * sizeof(float), 0); bos.rms_ffn_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.rms_final_bo.write(weights->rms_final_weight, dim * sizeof(float), 0); bos.rms_final_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wcls_bo.write(weights->wcls_weights, cls_size, 0); bos.wcls_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.wcls_s_bo.write(weights->wcls_scales, cls_scale_bytes, 0); bos.wcls_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // zero key/value cache
+    std::vector<float> zero_cache(cache_dim, 0.0f);
+    bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); bos.value_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    return bos;
+}
 
 
 /*-----------------------------------------------------------------------------------------*/
@@ -228,106 +352,153 @@ void init_quantized_tensors(void **ptr, QuantizedTensor<SIZE> *tensor, int n, in
   *ptr = p;
 }
 
-// Maps weights from a contiguous memory buffer to the transformer weights structure
-template <int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
-void memory_map_weights(TransformerWeights<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *w, void *ptr, uint8_t shared_classifier){
-  int head_size = dim / n_heads;
-  float *fptr = (float *)ptr;
-  std::memcpy(w->rms_att_weight, fptr, n_layers * dim * sizeof(float));
-  fptr += n_layers * dim;
-  std::memcpy(w->rms_ffn_weight, fptr, n_layers * dim * sizeof(float));
-  fptr += n_layers * dim;
-  std::memcpy(w->rms_final_weight, fptr, dim * sizeof(float));
-  fptr += dim;
 
-  ptr = (void *)fptr;
-  init_quantized_tensors(&ptr, w->q_tokens, 1, vocab_size * dim);
-  dequantize<vocab_size * dim>(w->q_tokens, w->token_embedding_table, GS);
-
-  init_quantized_tensors(&ptr, w->wq, n_layers, dim * (n_heads * head_size));
-  init_quantized_tensors(&ptr, w->wk, n_layers, dim * (n_kv_heads * head_size));
-  init_quantized_tensors(&ptr, w->wv, n_layers, dim * (n_kv_heads * head_size));
-  init_quantized_tensors(&ptr, w->wo, n_layers, (n_heads * head_size) * dim);
-
-  init_quantized_tensors(&ptr, w->w1, n_layers, dim * hidden_dim);
-  init_quantized_tensors(&ptr, w->w2, n_layers, hidden_dim * dim);
-  init_quantized_tensors(&ptr, w->w3, n_layers, dim * hidden_dim);
-
-  if (shared_classifier) {
-    std::memcpy(w->wcls, w->q_tokens, sizeof(QuantizedTensor<vocab_size * dim>));
-  } else {
-    init_quantized_tensors(&ptr, w->wcls, 1, dim * vocab_size);
-  }
+void read_checkpoint(std::string checkpoint, Weights *weights) {
+    FILE *file = fopen(checkpoint.c_str(), "rb");
+    if (!file) { 
+        fprintf(stderr, "Couldn't open %s\n", checkpoint.c_str()); 
+        exit(1); 
+    }
+    
+    // Read and validate header
+    uint32_t magic;
+    fread(&magic, sizeof(uint32_t), 1, file);
+    if (magic != 0x616b3432) { 
+        fprintf(stderr, "Bad magic number\n"); 
+        exit(1); 
+    }
+    
+    int version;
+    fread(&version, sizeof(int), 1, file);
+    if (version != 2) { 
+        fprintf(stderr, "Unsupported version %d\n", version); 
+        exit(1); 
+    }
+    
+    // Read config (skip, already have it from config.h)
+    Config temp_config;
+    int header_size = 256;
+    fread(&temp_config, sizeof(Config) - sizeof(int), 1, file);
+    
+    uint8_t shared_classifier;
+    fread(&shared_classifier, sizeof(uint8_t), 1, file);
+    
+    int group_size;
+    fread(&group_size, sizeof(int), 1, file);
+    
+    // Seek to start of weights
+    fseek(file, header_size, SEEK_SET);
+    
+    // Calculate sizes
+    const int kv_dim = (dim * n_kv_heads) / n_heads;
+    
+    // Allocate all weight arrays
+    weights->rms_att_weight = (float *)malloc(n_layers * dim * sizeof(float));
+    weights->rms_ffn_weight = (float *)malloc(n_layers * dim * sizeof(float));
+    weights->rms_final_weight = (float *)malloc(dim * sizeof(float));
+    
+    // Read RMS norm weights
+    fread(weights->rms_att_weight, sizeof(float), n_layers * dim, file);
+    fread(weights->rms_ffn_weight, sizeof(float), n_layers * dim, file);
+    fread(weights->rms_final_weight, sizeof(float), dim, file);
+    
+    // Token embedding - read quantized, then dequantize
+    int emb_size = vocab_size * dim;
+    int8_t *q_emb = (int8_t *)malloc(emb_size * sizeof(int8_t));
+    float *s_emb = (float *)malloc((emb_size / GS) * sizeof(float));
+    
+    fread(q_emb, sizeof(int8_t), emb_size, file);
+    fread(s_emb, sizeof(float), emb_size / GS, file);
+    
+    // Dequantize embedding for host
+    weights->token_embedding_table = (float *)malloc(emb_size * sizeof(float));
+    for (int i = 0; i < emb_size; i++) {
+        weights->token_embedding_table[i] = q_emb[i] * s_emb[i / GS];
+    }
+    
+    // Attention weights (all layers)
+    int att_size = n_layers * dim * dim;
+    int att_scale_size = att_size / GS;
+    
+    weights->wq_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
+    weights->wq_scales = (float *)malloc(att_scale_size * sizeof(float));
+    weights->wk_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
+    weights->wk_scales = (float *)malloc(att_scale_size * sizeof(float));
+    weights->wv_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
+    weights->wv_scales = (float *)malloc(att_scale_size * sizeof(float));
+    weights->wo_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
+    weights->wo_scales = (float *)malloc(att_scale_size * sizeof(float));
+    
+    // Read attention weights
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * dim * dim;
+        fread(&weights->wq_weights[offset], sizeof(int8_t), dim * dim, file);
+        fread(&weights->wq_scales[offset / GS], sizeof(float), dim * dim / GS, file);
+    }
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * dim * dim;
+        fread(&weights->wk_weights[offset], sizeof(int8_t), dim * dim, file);
+        fread(&weights->wk_scales[offset / GS], sizeof(float), dim * dim / GS, file);
+    }
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * dim * dim;
+        fread(&weights->wv_weights[offset], sizeof(int8_t), dim * dim, file);
+        fread(&weights->wv_scales[offset / GS], sizeof(float), dim * dim / GS, file);
+    }
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * dim * dim;
+        fread(&weights->wo_weights[offset], sizeof(int8_t), dim * dim, file);
+        fread(&weights->wo_scales[offset / GS], sizeof(float), dim * dim / GS, file);
+    }
+    
+    // FFN weights (all layers)
+    int ffn1_size = n_layers * dim * hidden_dim;
+    int ffn1_scale_size = ffn1_size / GS;
+    int ffn2_size = n_layers * hidden_dim * dim;
+    int ffn2_scale_size = ffn2_size / GS;
+    
+    weights->w1_weights = (int8_t *)malloc(ffn1_size * sizeof(int8_t));
+    weights->w1_scales = (float *)malloc(ffn1_scale_size * sizeof(float));
+    weights->w2_weights = (int8_t *)malloc(ffn2_size * sizeof(int8_t));
+    weights->w2_scales = (float *)malloc(ffn2_scale_size * sizeof(float));
+    weights->w3_weights = (int8_t *)malloc(ffn1_size * sizeof(int8_t));
+    weights->w3_scales = (float *)malloc(ffn1_scale_size * sizeof(float));
+    
+    // Read FFN weights
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * dim * hidden_dim;
+        fread(&weights->w1_weights[offset], sizeof(int8_t), dim * hidden_dim, file);
+        fread(&weights->w1_scales[offset / GS], sizeof(float), dim * hidden_dim / GS, file);
+    }
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * hidden_dim * dim;
+        fread(&weights->w2_weights[offset], sizeof(int8_t), hidden_dim * dim, file);
+        fread(&weights->w2_scales[offset / GS], sizeof(float), hidden_dim * dim / GS, file);
+    }
+    for (int l = 0; l < n_layers; l++) {
+        int offset = l * dim * hidden_dim;
+        fread(&weights->w3_weights[offset], sizeof(int8_t), dim * hidden_dim, file);
+        fread(&weights->w3_scales[offset / GS], sizeof(float), dim * hidden_dim / GS, file);
+    }
+    
+    // Classifier weights
+    int cls_size = vocab_size * dim;
+    int cls_scale_size = cls_size / GS;
+    
+    if (!shared_classifier) {
+        weights->wcls_weights = (int8_t *)malloc(cls_size * sizeof(int8_t));
+        weights->wcls_scales = (float *)malloc(cls_scale_size * sizeof(float));
+        
+        fread(weights->wcls_weights, sizeof(int8_t), cls_size, file);
+        fread(weights->wcls_scales, sizeof(float), cls_scale_size, file);
+    } else {
+        // Reuse token embedding weights
+        weights->wcls_weights = q_emb;  // Keep quantized version
+        weights->wcls_scales = s_emb;
+    }
+    
+    fclose(file);
 }
-
-// Reads checkpoint file, validates header, and memory maps weights
-template <int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
-void read_checkpoint(std::string checkpoint, Config *config, TransformerWeights<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *weights)
-{
-  FILE *file = fopen(checkpoint.c_str(), "rb");
-  if (!file) {
-    fprintf(stderr, "Couldn't open file %s\n", checkpoint.c_str());
-    exit(EXIT_FAILURE);
-  }
-
-  // Validate magic number ("ak42") and version (2)
-  uint32_t magic_number;
-  if (fread(&magic_number, sizeof(uint32_t), 1, file) != 1 || magic_number != 0x616b3432) {
-    fprintf(stderr, "Bad magic number\n");
-    exit(EXIT_FAILURE);
-  }
-  int version;
-  if (fread(&version, sizeof(int), 1, file) != 1 || version != 2) {
-    fprintf(stderr, "Bad version %d, need version 2\n", version);
-    exit(EXIT_FAILURE);
-  }
-
-  int header_size = 256; // header size for version 2
-
-  // Read model config (excluding GS)
-  if (fread(config, sizeof(Config) - sizeof(int), 1, file) != 1) {
-    fprintf(stderr, "Failed to read config\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // Read flags
-  uint8_t shared_classifier;
-  if (fread(&shared_classifier, sizeof(uint8_t), 1, file) != 1) {
-    fprintf(stderr, "Failed to read shared_classifier flag\n");
-    exit(EXIT_FAILURE);
-  }
-  int group_size;
-  if (fread(&group_size, sizeof(int), 1, file) != 1) {
-    fprintf(stderr, "Failed to read group_size\n");
-    exit(EXIT_FAILURE);
-  }
-  config->GS = GS;
-
-  // Get file size and close file
-  fseek(file, 0, SEEK_END);
-  auto file_size = ftell(file);
-  fclose(file);
-
-  // Memory map weights
-  int fd = open(checkpoint.c_str(), O_RDONLY);
-  if (fd == -1) {
-    fprintf(stderr, "open failed!\n");
-    exit(EXIT_FAILURE);
-  }
-  auto data = (float *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (data == MAP_FAILED) {
-    fprintf(stderr, "mmap failed!\n");
-    close(fd);
-    exit(EXIT_FAILURE);
-  }
-  void *weights_ptr = ((char *)data) + header_size;
-  memory_map_weights(weights, weights_ptr, shared_classifier);
-
-  close(fd);
-  munmap(data, file_size);
-}
-
-
 
 /*-----------------------------------------------------------------------------------------*/
 // Helpers: Encoding & Decoding
@@ -348,12 +519,6 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
 
 /*-----------------------------------------------------------------------------------------*/
 // Model & Tokenizer Builders
-
-// Read in the Config and the Weights from the checkpoint
-template <int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
-void build_transformer(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *t, std::string checkpoint_path) {
-  read_checkpoint(checkpoint_path, &t->config, &t->weights);
-}
 
 // Build the tokenizer from the tokenizer file
 void build_tokenizer(Tokenizer *t, std::string tokenizer_path, int vocab_size) {
@@ -555,6 +720,13 @@ void safe_printf(char *piece) {
   printf("%s", piece);
 }
 
+static void error_usage() {
+    fprintf(stderr,
+        "Usage: llama2_host <checkpoint> [-t <temperature>] [-p <top_p>] [-s <seed>] [-n <steps>]\n"
+        "                     [-i <prompt>] [-z <tokenizer>] [-m <mode>] [-k <kernel.xclbin>] [-e <eval_file>]\n");
+    exit(1);
+}
+
 long time_in_ms() {
   struct timespec time;
   clock_gettime(CLOCK_REALTIME, &time);
@@ -661,10 +833,23 @@ void print_comprehensive_results(BenchmarkEval& eval, long total_wall_time) {
            100.0f * eval.total_inference_time_ms / total_wall_time);
 }
 
-// Process a single story: tokenization, inference loop, and metric updates
-template<int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
-void process_story(const std::string& story_text, int story_num, Tokenizer* tokenizer, Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS>* transformer, xrt::kernel& kernel, xrt::bo& transformer_buffer, xrt::bo& key_buffer, xrt::bo& value_buffer, xrt::bo& out_buffer, float* logits, BenchmarkEval& eval) {
-    
+void process_story_flat(const std::string& story_text,
+                        int story_num, Tokenizer* tokenizer,
+                        Weights *weights, xrt::kernel& kernel,
+                        xrt::bo& emb_bo,
+                        xrt::bo& wq_bo, xrt::bo& wq_s_bo,
+                        xrt::bo& wk_bo, xrt::bo& wk_s_bo,
+                        xrt::bo& wv_bo, xrt::bo& wv_s_bo,
+                        xrt::bo& wo_bo, xrt::bo& wo_s_bo,
+                        xrt::bo& w1_bo, xrt::bo& w1_s_bo,
+                        xrt::bo& w2_bo, xrt::bo& w2_s_bo,
+                        xrt::bo& w3_bo, xrt::bo& w3_s_bo,
+                        xrt::bo& rms_att_bo, xrt::bo& rms_ffn_bo, xrt::bo& rms_final_bo,
+                        xrt::bo& wcls_bo, xrt::bo& wcls_s_bo,
+                        xrt::bo& key_buffer, xrt::bo& value_buffer,
+                        xrt::bo& out_buffer,
+                        float* logits,
+                        BenchmarkEval& eval) {
     if (story_text.empty()) return;
 
     // Tokenize story
@@ -673,287 +858,387 @@ void process_story(const std::string& story_text, int story_num, Tokenizer* toke
     char* mutable_text = strdup(story_text.c_str());
     encode(tokenizer, mutable_text, 1, 0, tokens, &num_tokens);
     free(mutable_text);
-
-    if (num_tokens < 2) {
-        free(tokens);
-        return;
-    }
+    if (num_tokens < 2) { free(tokens); return; }
 
     printf("Story %d: %d tokens\n", story_num, num_tokens);
 
-    // Timing variables
     long story_start_time = time_in_ms();
     long first_token_time = 0;
     long total_story_inference_time = 0;
     int inference_calls = 0;
 
-    // Process each token
-    for (int local_pos = 0; local_pos < num_tokens - 1; local_pos++) {
+    // Per-token inference
+    for (int local_pos = 0; local_pos < num_tokens - 1; ++local_pos) {
         int current_token = tokens[local_pos];
         int target_token = tokens[local_pos + 1];
 
-        // Time individual inference call
-        long inference_start = time_in_ms();
-        
-        auto run = kernel(transformer_buffer, current_token, local_pos,
-                         key_buffer, value_buffer, out_buffer);
+        long inf_start = time_in_ms();
+
+        auto run = kernel(
+            emb_bo,
+            wq_bo, wq_s_bo,
+            wk_bo, wk_s_bo,
+            wv_bo, wv_s_bo,
+            wo_bo, wo_s_bo,
+            w1_bo, w1_s_bo,
+            w2_bo, w2_s_bo,
+            w3_bo, w3_s_bo,
+            rms_att_bo,
+            rms_ffn_bo,
+            rms_final_bo,
+            wcls_bo, wcls_s_bo,
+            key_buffer,
+            value_buffer,
+            out_buffer,
+            current_token,
+            local_pos
+        );
         run.wait();
-        
-        long inference_end = time_in_ms();
-        long inference_time = inference_end - inference_start;
-        
-        // Track first token latency separately
-        if (local_pos == 0) first_token_time = inference_time;
-        
-        total_story_inference_time += inference_time;
+
+        long inf_end = time_in_ms();
+        long inf_time = inf_end - inf_start;
+        if (local_pos == 0) first_token_time = inf_time;
+        total_story_inference_time += inf_time;
         inference_calls++;
 
-        // Read results and update perplexity
         out_buffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        out_buffer.read(logits, transformer->config.vocab_size * sizeof(float), 0);
-        
+        out_buffer.read(logits, vocab_size * sizeof(float), 0);
+
         update_perplexity_eval(&eval, logits, target_token);
     }
 
-    // Calculate story-level metrics
     float story_throughput = (num_tokens - 1) / (float)total_story_inference_time * 1000.0f;
-    
-    // Update benchmark statistics
     eval.total_inference_time_ms += total_story_inference_time;
     eval.total_first_token_time_ms += first_token_time;
     eval.total_stories++;
     eval.total_inference_calls += inference_calls;
-    
     eval.story_throughputs.push_back(story_throughput);
     eval.story_first_token_latencies.push_back(first_token_time);
     eval.story_token_counts.push_back(num_tokens - 1);
 
-    printf("  Story %d: %.2f tok/s, first token: %ld ms\n", 
+    printf("  Story %d: %.2f tok/s, first token: %ld ms\n",
            story_num, story_throughput, first_token_time);
 
     free(tokens);
 }
 
-
-
 /*-----------------------------------------------------------------------------------------*/
 // Generation Loop
 
-template <int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
-void generate(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, std::string &kernelpath)
+void generate(Weights *weights, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, std::string &kernelpath)
 {
-  const char *empty_prompt = "";
-  if (prompt == NULL)
-  {
-    prompt = (char*)empty_prompt;
-  }
+    #pragma HLS none
+    const char *empty_prompt = "";
+    if (prompt == NULL) prompt = (char*)empty_prompt;
 
-  // Encode the (string) prompt into tokens sequence
-  int num_prompt_tokens = 0;
-  int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-  encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-  if (num_prompt_tokens < 1)
-  {
-    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
-  }
+    int num_prompt_tokens = 0;
+    int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) { fprintf(stderr, "expected >=1 prompt token\n"); exit(1); }
 
-  std::cout << "Loading kernel..." << std::endl;
-  auto device = xrt::device(0);
-  auto uuid = device.load_xclbin(kernelpath);
-  auto kernel = xrt::kernel(device, uuid, "forward");
-  std::cout << "Out buffer size: " << vocab_size * sizeof(float) << std::endl;
-  std::cout << "Transformer size: " << sizeof(*transformer) << std::endl;
-  std::cout << "Allocating output buffer" << std::endl;
-  auto out_buffer = xrt::bo(device, vocab_size * sizeof(float), kernel.group_id(5));
+    auto device = xrt::device(0);
+    auto uuid = device.load_xclbin(kernelpath);
+    auto kernel = xrt::kernel(device, uuid, "forward");
 
-  int cache_dim = n_layers * seq_len * ((dim * n_kv_heads) / n_heads);
-  std::cout << "Allocating buffers" << std::endl;
-  auto transformer_buffer = xrt::bo(device, sizeof(*transformer), kernel.group_id(0));
+    // prepare device BOs (weights uploaded, caches zeroed)
+    DeviceBOs bos = prepare_device_bos(device, kernel, weights);
 
-  auto key_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(3));
-  auto value_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(4));
-
-  std::cout << "Copying data to buffer" << std::endl;
-  transformer_buffer.write(transformer, sizeof(*transformer), 0);
-
-  transformer_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-  // start the main loop
-  long start = 0;               // used to time our code, only initialized after first iteration
-  int next;                     // will store the next token in the sequence
-  int token = prompt_tokens[0]; // kick off with the first token in the prompt
-  int pos = 0;                  // position in the sequence
-
-  // First run: process the initial token
-  auto run = kernel(transformer_buffer, token, pos, key_buffer, value_buffer, out_buffer);
-  run.wait();
-
-  float *logits = (float *)malloc(vocab_size * sizeof(float));
-  out_buffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-  out_buffer.read(logits, vocab_size * sizeof(float), 0);
-
-  // Advance the state machine: use prompt tokens if available, otherwise sample.
-  if (pos < num_prompt_tokens - 1) {
-    next = prompt_tokens[pos + 1];
-  } else {
-    next = sample(sampler, logits);
-  }
-  pos++;
-
-  // Print the token as string, decode it with the Tokenizer object
-  char *piece = decode(tokenizer, token, next);
-  safe_printf(piece); // printf("%s", piece), but skips "unsafe" bytes
-  fflush(stdout);
-  token = next;
-  start = time_in_ms();
-
-  // Main generation loop
-  while (pos < steps) {
-    run.set_arg(1, token);
-    run.set_arg(2, pos);
-    run.start();
+    // First call: run kernel with flattened args
+    int token = prompt_tokens[0];
+    int pos = 0;
+    auto run = kernel(
+        bos.emb_bo,
+        bos.wq_bo, bos.wq_s_bo,
+        bos.wk_bo, bos.wk_s_bo,
+        bos.wv_bo, bos.wv_s_bo,
+        bos.wo_bo, bos.wo_s_bo,
+        bos.w1_bo, bos.w1_s_bo,
+        bos.w2_bo, bos.w2_s_bo,
+        bos.w3_bo, bos.w3_s_bo,
+        bos.rms_att_bo,
+        bos.rms_ffn_bo,
+        bos.rms_final_bo,
+        bos.wcls_bo, bos.wcls_s_bo,
+        bos.key_bo,
+        bos.value_bo,
+        bos.out_bo,
+        token,
+        pos
+    );
     run.wait();
-    out_buffer.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    out_buffer.read(logits, vocab_size * sizeof(float), 0);
 
-    // Advance state machine: use prompt tokens if available, otherwise sample.
-    if (pos < num_prompt_tokens - 1) {
-      next = prompt_tokens[pos + 1];
-    } else {
-      next = sample(sampler, logits);
+    // read logits from the kernel output BO (use bos.out_bo)
+    std::vector<float> logits(vocab_size);
+    bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
+
+    // advance / sampling logic (same as before)
+    int next;
+    if (pos < num_prompt_tokens - 1) next = prompt_tokens[pos + 1];
+    else {
+        // greedy sample as fallback
+        int max_idx = 0;
+        for (int i = 1; i < vocab_size; ++i) if (logits[i] > logits[max_idx]) max_idx = i;
+        next = max_idx;
     }
     pos++;
-
-    // Stop generation if BOS (=1) token is produced.
-    if (next == 1) break;
-
-    // print the token as string, decode it with the Tokenizer object
     char *piece = decode(tokenizer, token, next);
-    safe_printf(piece); // printf("%s", piece), but skips "unsafe" bytes
+    safe_printf(piece);
     fflush(stdout);
     token = next;
-  }
-  printf("\n");
 
-  // report achieved tok/s (pos-1 because the timer starts after first iteration)
-  if (pos > 1) {
-    long end = time_in_ms();
-    fprintf(stderr, "Total (prompt & generation) achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
-  }
+    // subsequent loop: reuse BOs, set kernel args token/pos and start
+    long start = time_in_ms();
+    while (pos < steps) {
+        auto run2 = kernel(
+            bos.emb_bo,
+            bos.wq_bo, bos.wq_s_bo,
+            bos.wk_bo, bos.wk_s_bo,
+            bos.wv_bo, bos.wv_s_bo,
+            bos.wo_bo, bos.wo_s_bo,
+            bos.w1_bo, bos.w1_s_bo,
+            bos.w2_bo, bos.w2_s_bo,
+            bos.w3_bo, bos.w3_s_bo,
+            bos.rms_att_bo,
+            bos.rms_ffn_bo,
+            bos.rms_final_bo,
+            bos.wcls_bo, bos.wcls_s_bo,
+            bos.key_bo,
+            bos.value_bo,
+            bos.out_bo,
+            token,
+            pos
+        );
+        run2.wait();
+        bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
 
-  free(prompt_tokens);
+        if (pos < num_prompt_tokens - 1) next = prompt_tokens[pos + 1];
+        else {
+            int max_idx = 0;
+            for (int i = 1; i < vocab_size; ++i) if (logits[i] > logits[max_idx]) max_idx = i;
+            next = max_idx;
+        }
+        pos++;
+        if (next == 1) break;
+        char *piece2 = decode(tokenizer, token, next);
+        safe_printf(piece2); fflush(stdout);
+        token = next;
+    }
+    printf("\n");
+
+    // cleanup BOs (RAII will free); free host prompt tokens
+    free(prompt_tokens);
 }
 
 /*-----------------------------------------------------------------------------------------*/
 // Evaluation Loop
 
-template<int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int GS>
-void evaluate_with_benchmarking(std::string text_file, 
-                               Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS>* transformer, 
-                               Tokenizer* tokenizer, 
-                               const std::string& kernelpath,
-                               int max_stories = 100) {
-
-    printf("=== EVALUATION (BENCH/PERPLEXITY) ===\n");
-    printf("File: %s\n", text_file.c_str());
-    printf("Max stories: %s\n", max_stories == -1 ? "unlimited" : std::to_string(max_stories).c_str());
-    
-    FILE* file = fopen(text_file.c_str(), "r");
-    if (!file) {
-        fprintf(stderr, "Error: Cannot open %s\n", text_file.c_str());
-        return;
-    }
-    
-    BenchmarkEval eval = {
-        .total_log_prob = 0.0f,
-        .total_tokens = 0,
-        .vocab_size = vocab_size,
-        .enabled = true,
-        .total_inference_time_ms = 0,
-        .total_first_token_time_ms = 0,
-        .total_stories = 0,
-        .total_inference_calls = 0
-    };
-    
+void evaluate(const std::string& text_file,
+                        Weights *weights,
+                        Tokenizer *tokenizer,
+                        const std::string &kernelpath,
+                        int max_stories = 25) {
     // FPGA setup
-    printf("Initializing FPGA kernel...\n");
     auto device = xrt::device(0);
     auto uuid = device.load_xclbin(kernelpath);
     auto kernel = xrt::kernel(device, uuid, "forward");
-    
-    auto out_buffer = xrt::bo(device, vocab_size * sizeof(float), kernel.group_id(5));
-    int cache_dim = n_layers * seq_len * ((dim * n_kv_heads) / n_heads);
-    
-    auto transformer_buffer = xrt::bo(device, sizeof(*transformer), kernel.group_id(0));
-    auto key_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(3));
-    auto value_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(4));
-    
-    transformer_buffer.write(transformer, sizeof(*transformer), 0);
-    transformer_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    float* logits = (float*)malloc(transformer->config.vocab_size * sizeof(float));
 
-    // Story processing
-    std::string current_story = "";
-    char line[4096];
+    DeviceBOs bos = prepare_device_bos(device, kernel, weights);
+
+    // compute cache size & zero buffer used to clear KV between stories
+    const size_t cache_dim = (size_t)n_layers * seq_len * ((dim * n_kv_heads) / n_heads);
+    std::vector<float> zero_cache(cache_dim, 0.0f);
+
+    // open file and iterate stories
+    FILE *file = fopen(text_file.c_str(), "r");
+    if (!file) {
+        fprintf(stderr, "Error: cannot open %s\n", text_file.c_str());
+        return;
+    }
+
+    // Running evaluation accumulators
+    BenchmarkEval eval = {};
+    eval.enabled = true;
+    eval.vocab_size = vocab_size;
+    eval.total_log_prob = 0.0f;
+    eval.total_tokens = 0;
+    eval.total_inference_time_ms = 0;
+    eval.total_first_token_time_ms = 0;
+    eval.total_stories = 0;
+    eval.total_inference_calls = 0;
+
     int stories_processed = 0;
-    
-    printf("Starting evaluation...\n");
+    char line[4096];
+    std::string current_story;
     long overall_start = time_in_ms();
-    
-    // Main processing loop
+
+    // buffers used per-inference
+    std::vector<float> logits(vocab_size);
+    auto first_words = [](const std::string &s, int max_words, int max_chars) {
+        std::string out;
+        int words = 0;
+        for (size_t i = 0; i < s.size() && (int)out.size() < max_chars; ++i) {
+            char c = s[i];
+            out.push_back(c);
+            if (c == ' ' || c == '\n' || c == '\t') {
+                // count word boundary only when next char is non-space
+                if (i + 1 < s.size() && s[i+1] != ' ' && s[i+1] != '\n' && s[i+1] != '\t') {
+                    ++words;
+                    if (words >= max_words) break;
+                }
+            }
+        }
+        // trim trailing spaces
+        while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
+        if (out.size() > 0 && (int)out.size() > max_chars) out.resize(max_chars);
+        return out;
+    };
+
     while (fgets(line, sizeof(line), file)) {
         if (max_stories > 0 && stories_processed >= max_stories) break;
-
         line[strcspn(line, "\n")] = 0;
         if (strlen(line) == 0) continue;
-        
+
         if (strcmp(line, "<|endoftext|>") == 0) {
-            if (!current_story.empty()) {
-                // Clear cache before each story for consistent measurements
-                clear_kv_cache(key_buffer, value_buffer, cache_dim);
-                process_story<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS>(current_story, stories_processed + 1, tokenizer, transformer, kernel, transformer_buffer, key_buffer, value_buffer, out_buffer, logits, eval);
-                stories_processed++;
-                current_story = "";
+            if (current_story.empty()) continue;
+
+            // tokenize story
+            int num_tokens = 0;
+            // allocate a safe per-story token buffer sized to worst-case:
+            // worst-case: each byte becomes a token (+prefix tokens). reserve at least seq_len+4.
+            int safe_capacity = std::max((int)current_story.length() * 2 + 16, seq_len + 4);
+            std::vector<int> tokens_buf(safe_capacity);
+            char *dup = strdup(current_story.c_str());
+            encode(tokenizer, dup, 1, 0, tokens_buf.data(), &num_tokens);
+            free(dup);
+            // Defensive check: encode shouldn't write past safe_capacity. If it did, clamp.
+            if (num_tokens > safe_capacity) {
+                fprintf(stderr, "Warning: encode produced %d tokens but buffer capacity was %d; clamping\n",
+                        num_tokens, safe_capacity);
+                num_tokens = safe_capacity;
             }
+            if (num_tokens < 2) { current_story.clear(); continue; }
+
+            // Clear device KV cache for this story
+            bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); bos.value_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // Per-story accumulators
+            double story_logprob_sum = 0.0;
+            int story_token_count = 0;
+            long story_total_infer_ms = 0;
+            long story_first_token_ms = 0;
+
+            std::string preview = first_words(current_story, 6, 120);
+
+            // per-token inference loop
+            for (int local_pos = 0; local_pos < num_tokens - 1; ++local_pos) {
+              // ensure we do not exceed kernel seq_len (kernel expects pos < seq_len)
+                if (local_pos >= seq_len) {
+                  fprintf(stderr, "Warning: story %d has > seq_len (%d) tokens; truncating at %d\n",
+                          stories_processed + 1, seq_len, seq_len);
+                  break;
+                }
+                int current_token = tokens_buf[local_pos];
+                int target_token = tokens_buf[local_pos + 1];
+                if (target_token < 0 || target_token >= vocab_size) {
+                    fprintf(stderr, "Warning: invalid target token id %d (story %d pos %d). Skipping.\n",
+                            target_token, stories_processed + 1, local_pos);
+                    continue;
+                }
+
+                long inf_start = time_in_ms();
+
+                auto run = kernel(
+                  bos.emb_bo,
+                  bos.wq_bo, bos.wq_s_bo,
+                  bos.wk_bo, bos.wk_s_bo,
+                  bos.wv_bo, bos.wv_s_bo,
+                  bos.wo_bo, bos.wo_s_bo,
+                  bos.w1_bo, bos.w1_s_bo,
+                  bos.w2_bo, bos.w2_s_bo,
+                  bos.w3_bo, bos.w3_s_bo,
+                  bos.rms_att_bo,
+                  bos.rms_ffn_bo,
+                  bos.rms_final_bo,
+                  bos.wcls_bo, bos.wcls_s_bo,
+                  bos.key_bo,
+                  bos.value_bo,
+                  bos.out_bo,
+                  current_token,
+                  local_pos
+                );
+                run.wait();
+
+                long inf_end = time_in_ms();
+                long inf_time = inf_end - inf_start;
+                if (local_pos == 0) story_first_token_ms = inf_time;
+                story_total_infer_ms += inf_time;
+
+                bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
+
+                // accumulate log-prob for this token
+                float lp = compute_log_prob(logits.data(), target_token, vocab_size);
+                story_logprob_sum += lp;
+                story_token_count++;
+
+                // update running eval
+            }
+
+            // compute per-story metrics
+            float story_perplexity = -1.0f;
+            if (story_token_count > 0) {
+                float avg_nll = - (float)(story_logprob_sum / story_token_count);
+                story_perplexity = expf(avg_nll);
+            }
+            float story_throughput = (story_total_infer_ms > 0 && story_token_count > 0) ?
+                                     (story_token_count / (float)story_total_infer_ms * 1000.0f) : 0.0f;
+
+            // update running eval
+            eval.total_log_prob += (float)story_logprob_sum;
+            eval.total_tokens += story_token_count;
+            eval.total_inference_time_ms += story_total_infer_ms;
+            eval.total_first_token_time_ms += story_first_token_ms;
+            eval.total_stories++;
+            eval.total_inference_calls += story_token_count;
+            if (story_throughput > 0.0f) eval.story_throughputs.push_back(story_throughput);
+            eval.story_first_token_latencies.push_back(story_first_token_ms);
+            eval.story_token_counts.push_back(story_token_count);
+
+            // running metrics
+            float running_perplexity = calculate_final_perplexity(&eval);
+            float running_throughput = (eval.total_inference_time_ms > 0) ?
+                                       (eval.total_tokens / (float)eval.total_inference_time_ms * 1000.0f) : 0.0f;
+
+            // Print concise per-story report
+            printf("Story %d: preview=\"%s\"\n", stories_processed + 1, preview.c_str());
+            printf("  tokens=%d  perplexity=%.4f  throughput=%.2f tok/s  first_token=%ld ms\n",
+                   story_token_count, story_perplexity, story_throughput, story_first_token_ms);
+            printf("  running: stories=%d  tokens=%d  perplexity=%.4f  throughput=%.2f tok/s\n\n",
+                   eval.total_stories, eval.total_tokens, running_perplexity, running_throughput);
+
+            stories_processed++;
+            current_story.clear();
         } else {
             if (!current_story.empty()) current_story += " ";
             current_story += line;
         }
     }
-    // Process final story
-    if (!current_story.empty() && (max_stories == -1 || stories_processed < max_stories)) {
-        clear_kv_cache(key_buffer, value_buffer, cache_dim);
-        process_story<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS>(current_story, stories_processed + 1, tokenizer, transformer, kernel, transformer_buffer, key_buffer, value_buffer, out_buffer, logits, eval);        stories_processed++;
-    }
-    
+
     long overall_end = time_in_ms();
     fclose(file);
-    free(logits);
-    print_comprehensive_results(eval, overall_end - overall_start);
-}
 
-/*-----------------------------------------------------------------------------------------*/
-// CLI
-#ifndef TESTING
+    fprintf(stderr, "Processed %d stories in %ld ms\n", stories_processed, overall_end - overall_start);
 
-void error_usage()
-{
-  fprintf(stderr, "Usage:   ./llama2 <checkpoint> [options]\n");
-  fprintf(stderr, "Example: ./llama2 model.bin -n 256 -i \"Once upon a time\"\n");
-  fprintf(stderr, "Example: ./llama2 model.bin -m evaluate -e evalfile.txt\"\n");
-  fprintf(stderr, "Options:\n");
-  fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
-  fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
-  fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
-  fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-  fprintf(stderr, "  -i <string> input prompt\n");
-  fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-  fprintf(stderr, "  -m <string> mode: generate|chat|evaluate, default: generate\n");
-  fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
-  fprintf(stderr, "  -e <file>   evaluation input text file\n");
-  exit(EXIT_FAILURE);
+    // print final summary
+    float final_perplexity = calculate_final_perplexity(&eval);
+    float overall_throughput = (eval.total_inference_time_ms > 0) ?
+                               (eval.total_tokens / (float)eval.total_inference_time_ms * 1000.0f) : 0.0f;
+    fprintf(stderr, "FINAL: stories=%d tokens=%d perplexity=%.4f throughput=%.2f tok/s avg_first_token_ms=%.2f\n",
+            eval.total_stories, eval.total_tokens, final_perplexity, overall_throughput,
+            (eval.total_stories > 0) ? (eval.total_first_token_time_ms / (double)eval.total_stories) : 0.0);
 }
 
 int main(int argc, char *argv[])
@@ -1023,24 +1308,25 @@ int main(int argc, char *argv[])
   if (topp < 0.0f || topp > 1.0f) topp = 0.9f;
 
   // Build Transformer
-  static Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> transformer;
-  build_transformer(&transformer, checkpoint_path);
-  if (steps <= 0 || steps > transformer.config.seq_len)
-    steps = transformer.config.seq_len;
+  Weights weights;
+  read_checkpoint(checkpoint_path, &weights);
+  if (steps <= 0 || steps > seq_len)
+    steps = seq_len;
 
   // Build Tokenizer
   Tokenizer tokenizer;
-  build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
+  build_tokenizer(&tokenizer, tokenizer_path, vocab_size);
 
   // Build Sampler
   Sampler sampler;
-  build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+  build_sampler(&sampler, vocab_size, temperature, topp, rng_seed);
 
   // Run generation or other modes
   if (mode == "generate") {
-    generate(&transformer, &tokenizer, &sampler, prompt, steps, kernelpath);
+    generate(&weights, &tokenizer, &sampler, prompt, steps, kernelpath);
   } else if (mode == "evaluate") {
-    evaluate_with_benchmarking<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS>(eval_file, &transformer, &tokenizer, kernelpath);  } else {
+    evaluate(eval_file, &weights, &tokenizer, kernelpath);  
+  } else {
     fprintf(stderr, "unknown mode: %s\n", mode.c_str());
     error_usage();
   }
@@ -1053,4 +1339,3 @@ int main(int argc, char *argv[])
   free(tokenizer.sorted_vocab);
   return 0;
 }
-#endif

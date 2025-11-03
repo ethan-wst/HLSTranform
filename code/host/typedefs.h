@@ -97,4 +97,7 @@ struct Transformer
   // float *data;       // memory mapped data pointer
   // ssize_t file_size; // size of the checkpoint file in bytes
 };
+
+
+
 #endif

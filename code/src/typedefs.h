@@ -6,6 +6,8 @@
 #ifndef TYPEDEFS
 #define TYPEDEFS
 
+constexpr float inv_10000 = 1.0f / 10000.0f;
+
 // Configuration structure for transformer hyperparameters
 struct Config {
     int dim;          // transformer dimension
