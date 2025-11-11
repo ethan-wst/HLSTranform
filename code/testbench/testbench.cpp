@@ -373,7 +373,7 @@ int main() {
     int token = prompt_tokens[0];
     int pos = 0;
     int next = 0;
-    int steps = 7;
+    int steps = 15;
     
     std::cout << "Input: " << prompt << std::endl;
     std::cout << "Output: " << std::endl;

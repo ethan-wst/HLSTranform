@@ -20,11 +20,4 @@ struct Config {
     int GS;           // group size for quantization
 };
 
-// Quantized tensor structure: int8 quantized values with per-group float scales
-template<int SIZE>
-struct QuantizedTensor {
-    int8_t q[SIZE];      // quantized values
-    float s[SIZE / 64];  // scaling factors (one per group, assuming GS=64)
-};
-
 #endif

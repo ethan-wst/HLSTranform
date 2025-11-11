@@ -86,6 +86,8 @@ void FFN_matmul(float o[hidden_dim],
                 int8_t *w1_weights, float *w1_scales,
                 int8_t *w3_weights, float *w3_scales);
 
+
+
 // ============================================================================
 // TEMPLATE HELPER FUNCTIONS
 // ============================================================================
@@ -93,8 +95,7 @@ void FFN_matmul(float o[hidden_dim],
 template<int SIZE>
 void residual_add(float x[SIZE], float residual[SIZE]) {
     
-    
-    add_loop:
+    residual_loop:
     for (int i = 0; i < SIZE; i++) {
         #pragma HLS PIPELINE II=1
         #pragma HLS LOOP_TRIPCOUNT min=768 max=768
@@ -107,15 +108,25 @@ void residual_add(float x[SIZE], float residual[SIZE]) {
 template<int S>
 void rmsnorm(float o[S], float x[S], float weight[S]) {
     
-    
+    float w_buffer[S];
+    #pragma HLS ARRAY_PARTITION variable=w_buffer type=cyclic factor=64
+    rms_buffer:
+    for (int i = 0; i < S; i ++) {
+        #pragma HLS PIPELINE II=1
+        w_buffer[i] = weight[i];
+    }
+
     // Calculate sum of squares
     float ss = 0.0f;
     sum_squares:
     for (int j = 0; j < S; j++) {
+        #pragma HLS PIPELINE
+        #pragma HLS UNROLL factor=64
         #pragma HLS LOOP_TRIPCOUNT min=768 max=768
 
         ss += x[j] * x[j];
     }
+
     ss /= S;
     ss += 1e-5f;
     ss = 1.0f / hls::sqrtf(ss);
@@ -123,23 +134,22 @@ void rmsnorm(float o[S], float x[S], float weight[S]) {
     // Normalize and scale
     normalize:
     for (int j = 0; j < S; j++) {
-        #pragma HLS PIPELINE II=1
+        #pragma HLS PIPELINE
+        #pragma HLS UNROLL factor=64
         #pragma HLS LOOP_TRIPCOUNT min=768 max=768
 
-        o[j] = weight[j] * (ss * x[j]);
+        o[j] = w_buffer[j] * (ss * x[j]);
     }
 }
 
 // TODO: Look into find_max/exp_sum reduction and loop-carried dependency optimizations
 template<int SIZE>
 void softmax(float *x, int size) {
-    
-    
     // Find max
     float max_val = x[0];
     find_max:
     for (int i = 1; i < size; i++) {
-        #pragma HLS PIPELINE II=1   
+        #pragma HLS PIPELINE 
         #pragma HLS LOOP_TRIPCOUNT min=1024 max=1024
 
         if (x[i] > max_val) max_val = x[i];
@@ -149,6 +159,7 @@ void softmax(float *x, int size) {
     float sum = 0.0f;
     exp_sum:
     for (int i = 0; i < size; i++) {
+        #pragma HLS PIPELINE
         #pragma HLS LOOP_TRIPCOUNT min=1024 max=1024
 
         x[i] = hls::expf(x[i] - max_val);
@@ -156,63 +167,63 @@ void softmax(float *x, int size) {
     }
     
     // Normalize
-    // TODO: Array partitioning & unroolling
     normalize:
     for (int i = 0; i < size; i++) {
-        #pragma HLS PIPELINE II=1
+        #pragma HLS PIPELINE
         #pragma HLS LOOP_TRIPCOUNT min=1024 max=1024
 
         x[i] /= sum;
     }
 }
 
-// TODO: Optimize further, maybe dataflow enternally
-// TODO: work around with accumulators, ival and acc[]
-template<int D, int N, int UNROLL=4>
+// TODO: Figure out optimization, multirow or multicol
+// Matrix * vector, wq (D*N) by xq (N elements) -> xout (D)
+template<int D, int N>
 void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
     
+    matmul_outer:
+    for (int i = 0; i < D; i++) {
 
-    outer:
-    for (int i = 0; i < D; i+=UNROLL) {
-        #pragma HLS LOOP_TRIPCOUNT min=192 max=8000
+        float val = 0.0f;
 
-        float val[UNROLL];
-        #pragma HLS ARRAY_PARTITION variable=val complete
-        
-        init:
-        for (int u = 0; u < 4; u++) {
-            #pragma HLS UNROLL
-            val[u] = 0.0f;
+        int8_t wq_buffer[N];
+        float ws_buffer[N/GS];
+
+        #pragma HLS ARRAY_PARTITION variable=wq_buffer type=cyclic factor=32
+        #pragma HLS ARRAY_PARTITION variable=ws_buffer type=cyclic factor=32
+
+        // Initialize wq buffer (N) for each row of wq (D*N)
+        matmul_wq_buffer:
+        for (int j = 0; j < N; j++) {
+            #pragma HLS PIPELINE II=1
+            wq_buffer[j] = wq[j + (i * N)];
         }
 
-        inner:
+        // Initialize ws buffer (N/GS) for each row of wq (D*N/GS)
+        matmul_ws_buffer:
+        for (int j = 0; j < N/GS; j++) {
+            #pragma HLS PIPELINE II=1
+            ws_buffer[j] = ws[(i * N / GS) + j];
+        }
+
+        matmul_groups:
         for (int j = 0; j <= N - GS; j += GS) {
-            #pragma HLS PIPELINE II = 1
-            #pragma HLS LOOP_TRIPCOUNT min=12 max=32
-            
-            parallel_rows:
-            for (int u = 0; u < UNROLL; u++) {
-                #pragma HLS UNROLL
+            #pragma HLS PIPELINE
 
-                int32_t ival = 0;
+            int32_t dot = 0;
 
-                dot:
-                for (int k = 0; k < GS; k++) {
-                    #pragma HLS UNROLL factor = 16
-                    ival += ((int32_t)xq[j + k]) * ((int32_t)wq[(i+u) * N + j + k]);
-                }
-                float scale = ws[(i + u) * N / GS + j / GS] * xs[j / GS];
-                val[u] += ((float)ival) * scale;
+            dot_product:
+            for (int k = 0; k < GS; k++) {
+                #pragma HLS UNROLL factor=32
+
+                    dot += ((int32_t)xq[j+k]) * ((int32_t)wq_buffer[j+k]);
             }
+            val += ((float)dot) * ws_buffer[j / GS] * xs[j / GS];
         }
-
-        write_back_matmul:
-        for (int u = 0; u < UNROLL; u++) {
-            #pragma HLS UNROLL
-            xout[i + u] = val[u];
-        }
+        xout[i] = val;
     }
 }
+
 
 // TODO: find max reduction work around, causing slack
 template<int S>
@@ -223,31 +234,30 @@ void quantize(int8_t qx_q[S], float qx_s[S/GS], float x[S]) {
     constexpr float inv_Q_MAX = 1.0f / 127.0f;
     
     main_loop:
-    for (int group = 0; group < num_groups; group++) {
-        #pragma HLS PIPELINE II = 1
+    for (int i = 0; i < S/GS; i++) {
+        #pragma HLS PIPELINE
+        #pragma HLS UNROLL factor=64
         #pragma HLS LOOP_TRIPCOUNT min=12 max=32
 
         
         // Find max absolute value in group
         float wmax = 0.0f;
         find_max:
-        for (int i = 0; i < GS; i++) {
-            #pragma HLS UNROLL factor = 16 skip_exit_check
-            float val = std::abs(x[group * GS + i]);
+        for (int j = 0; j < GS; j++) {
+            float val = std::abs(x[i * GS + j]);
             if (val > wmax) wmax = val;
         }
         
         // Calculate scale and quantize
         float scale = wmax * inv_Q_MAX;
-        qx_s[group] = scale;
+        qx_s[i] = scale;
         
-        float inv_scale = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
+        float inv_scale = 1.0f / scale;
         
         quantize_group:
-        for (int i = 0; i < GS; i++) {
-            #pragma HLS UNROLL factor = 16 skip_exit_check
-            float quant_val = x[group * GS + i] * inv_scale;
-            qx_q[group * GS + i] = (int8_t)quant_val;
+        for (int j = 0; j < GS; j++) {
+            float quant_val = x[i * GS + j] * inv_scale;
+            qx_q[i * GS + j] = (int8_t)quant_val;
         }
     }
 }

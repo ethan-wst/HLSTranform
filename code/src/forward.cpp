@@ -12,7 +12,6 @@
 // Load token embedding from lookup table
 void load_embedding(float *token_embedding_table, float x[dim], int token) {
 
-    
     load_loop:
     for (int i = 0; i < dim; i++) {
         #pragma HLS PIPELINE II=1
@@ -22,16 +21,17 @@ void load_embedding(float *token_embedding_table, float x[dim], int token) {
     }
 }
 
-// Apply RoPE (Rotary Position Embedding) to query and key vectors
+// ATTENTION BLOCK HELPERS =====================================================
+
 void rope_rotation(float q_in[dim], float k_in[kv_dim], float q_out[dim], float k_out[kv_dim], int pos) {
 
-    
     const float inv_head_size = 1.0f / float(head_size);
     
     // Rotate both Q and K for kv_dim dimensions
     rotation1:
     for (int i = 0; i < kv_dim; i += 2) {
-        #pragma HLS PIPELINE II=1
+        #pragma HLS PIPELINE
+        #pragma HLS UNROLL factor = 8
         #pragma HLS LOOP_TRIPCOUNT min=384 max=384
         
         int head_dim = i % head_size;
@@ -56,7 +56,8 @@ void rope_rotation(float q_in[dim], float k_in[kv_dim], float q_out[dim], float 
     // Rotate only Q for remaining dimensions (MQA case)
     rotation2:
     for (int i = kv_dim; i < dim; i += 2) {
-        #pragma HLS PIPELINE II=1
+        #pragma HLS PIPELINE
+        #pragma HLS UNROLL factor = 8
         #pragma HLS LOOP_TRIPCOUNT min=0 max=384
         
         int head_dim = i % head_size;
@@ -72,11 +73,32 @@ void rope_rotation(float q_in[dim], float k_in[kv_dim], float q_out[dim], float 
     }
 }
 
-// Compute multi-head attention with KV cache
+void QKV_matmul_rotation(int pos, float q[dim], float k[kv_dim], float v[kv_dim], 
+                int8_t xq_q[dim], float xq_s[dim/GS],
+                int8_t *wq_weights, float *wq_scales,
+                int8_t *wk_weights, float *wk_scales,
+                int8_t *wv_weights, float *wv_scales
+                ) {
+
+
+    // TODO: Research workaround for xq_q/xq_s reuse to dataflow
+
+    float q_prerope[dim];
+    float k_prerope[kv_dim];
+    #pragma HLS ARRAY_PARTITION variable=q_prerope type=cyclic factor=8
+    #pragma HLS ARRAY_PARTITION variable=k_prerope type=cyclic factor=8
+
+    matmul<dim, dim>(q_prerope, xq_q, xq_s, wq_weights, wq_scales);
+    matmul<kv_dim, dim>(k_prerope, xq_q, xq_s, wk_weights, wk_scales);
+    matmul<kv_dim, dim>(v, xq_q, xq_s, wv_weights, wv_scales);
+
+    rope_rotation(q_prerope, k_prerope, q, k, pos);
+}
+
+// TODO: needs optimizing, caches are randomly accessed
 void multihead_attention_with_cache(float q[dim], float k[kv_dim], float v[kv_dim], float *key_cache, float *value_cache, 
     float xb[dim], float att[n_heads * seq_len], int layer, int pos) {
 
-    
     const int kv_cache_layer_offset = layer * seq_len * kv_dim;
     const int kv_cache_pos_offset = kv_cache_layer_offset + pos * kv_dim;
     const float inv_sqrt_head_size = 1.0f / hls::sqrtf((float)head_size);
@@ -154,7 +176,8 @@ void multihead_attention_with_cache(float q[dim], float k[kv_dim], float v[kv_di
     }
 }
 
-// Apply SwiGLU activation: hb = SiLU(hb) * hb2
+// FFN BLOCK HELPER ================================================================
+
 void swiglu_activation(float hb[hidden_dim], float hb2[hidden_dim], float o[hidden_dim]) {
 
     
@@ -169,44 +192,19 @@ void swiglu_activation(float hb[hidden_dim], float hb2[hidden_dim], float o[hidd
     }
 }
 
-
-void QKV_matmul_rotation(int pos, float q[dim], float k[kv_dim], float v[kv_dim], int8_t xq_q[dim], float xq_s[dim/GS],
-                int8_t *wq_weights, float *wq_scales,
-                int8_t *wk_weights, float *wk_scales,
-                int8_t *wv_weights, float *wv_scales
-                ) {
-
-
-    // TODO: Research workaround for xq_q/xq_s reuse
-    // #pragma HLS DATAFLOW
-
-    float q_prerope[dim];
-    #pragma HLS ARRAY_PARTITION variable=q_prerope cyclic factor=8
-
-    float k_prerope[kv_dim];
-    #pragma HLS ARRAY_PARTITION variable=k_prerope cyclic factor=8
-
-    matmul<dim, dim>(q_prerope, xq_q, xq_s, wq_weights, wq_scales);
-    matmul<kv_dim, dim>(k_prerope, xq_q, xq_s, wk_weights, wk_scales);
-    matmul<kv_dim, dim>(v, xq_q, xq_s, wv_weights, wv_scales);
-
-    rope_rotation(q_prerope, k_prerope, q, k, pos);
-}
-
 void FFN_matmul(float o[hidden_dim], 
                 int8_t xq_q[dim], float xq_s[dim/64],
                 int8_t *w1_weights, float *w1_scales,
-                int8_t *w3_weights, float *w3_scales
-            ){
+                int8_t *w3_weights, float *w3_scales ){
 
     // TODO: Research workaround for xq_q/xq_s reuse
     // #pragma HLS DATAFLOW
 
     float hb[hidden_dim];
-    #pragma HLS ARRAY_PARTITION variable=hb cyclic factor=8
-
     float hb2[hidden_dim];
-    #pragma HLS ARRAY_PARTITION variable=hb2 cyclic factor=8
+    #pragma HLS ARRAY_PARTITION variable=hb2 type=cyclic factor=8
+    #pragma HLS ARRAY_PARTITION variable=hb type=cyclic factor=8
+
 
     matmul<hidden_dim, dim>(hb, xq_q, xq_s, w1_weights, w1_scales);
     matmul<hidden_dim, dim>(hb2, xq_q, xq_s, w3_weights, w3_scales);
@@ -221,8 +219,8 @@ void FFN_matmul(float o[hidden_dim],
 // Attention block: RMSNorm -> QKV projection -> RoPE -> Attention -> Output projection
 void attention_block( 
     int layer, int pos,
-    float x[dim],       // Input (read-only)
-    float x_out[dim],   // Output (write-only)
+    float x[dim],
+    float x_out[dim],
     float att[n_heads * seq_len],
     int8_t *wq_weights, float *wq_scales,
     int8_t *wk_weights, float *wk_scales,
@@ -231,7 +229,6 @@ void attention_block(
     float *rms_att_weight,
     float *key_cache, float *value_cache
 ) {
-
     #pragma HLS DATAFLOW
 
     const int dim_dim_offset = layer * dim * dim;
@@ -239,26 +236,27 @@ void attention_block(
     const int rms_offset = layer * dim;
 
     // Local buffers
-    int8_t xq_q_qkv[dim];
-    float xq_s_qkv[dim/GS]; 
+    float xb_norm[dim]; 
     int8_t xq_q_proj[dim];
     float xq_s_proj[dim/GS];
-    float xb_att[dim];
-    float xb_norm[dim];
+    #pragma HLS ARRAY_PARTITION variable=xb_norm type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_q_proj type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_s_proj type=complete
+
     float q[dim];
-    float k[kv_dim]; 
+    float k[kv_dim];
     float v[kv_dim];
+    #pragma HLS ARRAY_PARTITION variable=q type=cyclic factor=8
+    #pragma HLS ARRAY_PARTITION variable=k type=cyclic factor=8
+    #pragma HLS ARRAY_PARTITION variable=v type=cyclic factor=8
 
-    #pragma HLS ARRAY_PARTITION variable=xq_q_qkv cyclic factor=64
-    #pragma HLS ARRAY_PARTITION variable=xq_s_qkv cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=xq_q_proj cyclic factor=64
-    #pragma HLS ARRAY_PARTITION variable=xq_s_proj cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=xb_att cyclic factor=16
-    #pragma HLS ARRAY_PARTITION variable=xb_norm cyclic factor=16
-    #pragma HLS ARRAY_PARTITION variable=q cyclic factor=8
-    #pragma HLS ARRAY_PARTITION variable=k cyclic factor=8
-    #pragma HLS ARRAY_PARTITION variable=v cyclic factor=8
-
+    float xb_att[dim];
+    int8_t xq_q_qkv[dim];
+    float xq_s_qkv[dim/GS]; 
+    #pragma HLS ARRAY_PARTITION variable=xb_att type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_q_qkv type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_s_qkv type=complete
+    
     // Attention preprocessing - Consumes x, Produce xq_q_qkv & xq_s_qkv
     rmsnorm<dim>(xb_norm, x, &rms_att_weight[rms_offset]);
     quantize<dim>(xq_q_qkv, xq_s_qkv, xb_norm);
@@ -288,29 +286,27 @@ void ffn_block(
     int8_t *w3_weights, float *w3_scales,
     float *rms_ffn_weight
 ) {
-    //TODO: Fix fifo depth, default is far to shallow
     #pragma HLS DATAFLOW
     
-
     const int dim_hidden_offset = layer * dim * hidden_dim;
     const int hidden_dim_offset = layer * hidden_dim * dim;
     const int rms_offset = layer * dim;
 
     // Local buffers
+    float xb_preproc[dim];
     int8_t xq_q_ffn[dim];
     float xq_s_ffn[dim/GS]; 
+    #pragma HLS ARRAY_PARTITION variable=xb_preproc type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_q_ffn type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_s_ffn type=complete
+
+    float hb_proj[hidden_dim];
     int8_t hq_q_proj[hidden_dim];
     float hq_s_proj[hidden_dim/GS]; 
-    float xb_preproc[dim];
-    float hb_proj[hidden_dim];
+    #pragma HLS ARRAY_PARTITION variable=hb_proj type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=hq_q_proj type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=hq_s_proj type=complete
 
-    #pragma HLS ARRAY_PARTITION variable=xq_q_ffn cyclic factor=64
-    #pragma HLS ARRAY_PARTITION variable=xq_s_ffn cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=hq_q_proj cyclic factor=64
-    #pragma HLS ARRAY_PARTITION variable=hq_s_proj cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=xb_preproc cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=hb_proj cyclic factor=4
-    
     // FFN preprocessing - Consumes x, Produces xq_q_ffn, xq_s_ffn
     rmsnorm<dim>(xb_preproc, x, &rms_ffn_weight[rms_offset]);
     quantize<dim>(xq_q_ffn, xq_s_ffn, xb_preproc);
@@ -331,16 +327,15 @@ void final_classifier(
     float *rms_final_weight,
     int8_t *wcls_weights, float *wcls_scales
 ) {
-
     #pragma HLS DATAFLOW
 
-    int8_t xq_q[dim];
-    float xq_s[dim/GS];
     float xb[dim];
+    int8_t xq_q[dim];    
+    float xq_s[dim/GS];
 
-    #pragma HLS ARRAY_PARTITION variable=xq_q cyclic factor=64
-    #pragma HLS ARRAY_PARTITION variable=xq_s cyclic factor=4
-    #pragma HLS ARRAY_PARTITION variable=xb cyclic factor=4
+    #pragma HLS ARRAY_PARTITION variable=xb type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_q type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=xq_s type=complete
     
     rmsnorm<dim>(xb, x, rms_final_weight);
     quantize<dim>(xq_q, xq_s, xb);
@@ -444,9 +439,9 @@ extern "C" void forward(
     float x_out[dim];
     float att[n_heads * seq_len];
 
-    #pragma HLS ARRAY_PARTITION variable=x cyclic factor=16
-    #pragma HLS ARRAY_PARTITION variable=x_out cyclic factor=16
-    #pragma HLS ARRAY_PARTITION variable=att cyclic factor=n_heads
+    #pragma HLS ARRAY_PARTITION variable=x type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=x_out type=cyclic factor=64
+    #pragma HLS ARRAY_PARTITION variable=att type=cyclic factor=n_heads
 
     // ============================================================================
     // Forward Pass Execution
@@ -459,6 +454,7 @@ extern "C" void forward(
     main_forward_loop:
     for (int l = 0; l < n_layers; l++) {
         #pragma HLS LOOP_TRIPCOUNT min=12 max=12
+        // TODO: Dataflow entire layer transforms (if possible)
         
         // Attention block - Dataflow
         attention_block(l, pos, x, x_out, att,
