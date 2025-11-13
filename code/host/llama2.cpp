@@ -561,7 +561,7 @@ long time_in_ms() {
   return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-// Zero out  cache buffers
+// Zero out cache buffers
 void clear_kv_cache(xrt::bo& key_buffer, xrt::bo& value_buffer, int cache_dim) {
     std::vector<float> zero_cache(cache_dim, 0.0f);
     key_buffer.write(zero_cache.data(), cache_dim * sizeof(float), 0);
@@ -762,6 +762,7 @@ void generate(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_
   auto device = xrt::device(0);
   auto uuid = device.load_xclbin(kernelpath);
   auto kernel = xrt::kernel(device, uuid, "forward");
+
   std::cout << "Out buffer size: " << vocab_size * sizeof(float) << std::endl;
   std::cout << "Transformer size: " << sizeof(*transformer) << std::endl;
   std::cout << "Allocating output buffer" << std::endl;
@@ -770,13 +771,13 @@ void generate(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_
   int cache_dim = n_layers * seq_len * ((dim * n_kv_heads) / n_heads);
   std::cout << "Allocating buffers" << std::endl;
   auto transformer_buffer = xrt::bo(device, sizeof(*transformer), kernel.group_id(0));
-
   auto key_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(3));
   auto value_buffer = xrt::bo(device, cache_dim * sizeof(float), kernel.group_id(4));
 
+  clear_kv_cache(key_buffer, value_buffer, cache_dim);
+
   std::cout << "Copying data to buffer" << std::endl;
   transformer_buffer.write(transformer, sizeof(*transformer), 0);
-
   transformer_buffer.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
   // start the main loop
