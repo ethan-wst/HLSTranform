@@ -9,7 +9,7 @@
 #include <cstdio>
 
 // ============================================================================
-// Tokenizer Structures (unchanged)
+// Tokenizer Structures
 // ============================================================================
 struct TokenIndex {
     char *str;
@@ -26,13 +26,13 @@ struct Tokenizer {
 };
 
 // ============================================================================
-// NEW: Flattened Weights Structure
+// Flattened Weights Structure
 // ============================================================================
-struct FlattenedWeights {
+struct Weights {
     // Embedding (dequantized for host use)
     float *token_embedding_table;
     
-    // Attention weights (quantized - keep in int8)
+    // Attention weights (quantized)
     int8_t *wq_weights;
     float *wq_scales;
     int8_t *wk_weights;
@@ -58,10 +58,13 @@ struct FlattenedWeights {
     // Classifier weights (quantized)
     int8_t *wcls_weights;
     float *wcls_scales;
+    
+    // Track if classifier is shared to avoid double-free
+    bool cls_is_shared;
 };
 
 // ============================================================================
-// Tokenizer Functions (unchanged)
+// Tokenizer Functions
 // ============================================================================
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex *)a)->str, ((TokenIndex *)b)->str);
@@ -79,7 +82,10 @@ void build_tokenizer(Tokenizer *t, std::string tokenizer_path, int vocab_size) {
     }
     
     FILE *file = fopen(tokenizer_path.c_str(), "rb");
-    if (!file) { std::cerr << "Failed to open tokenizer.\n"; exit(1); }
+    if (!file) { 
+        std::cerr << "Failed to open tokenizer: " << tokenizer_path << std::endl;
+        exit(1); 
+    }
     
     fread(&t->max_token_length, sizeof(int), 1, file);
     
@@ -95,6 +101,15 @@ void build_tokenizer(Tokenizer *t, std::string tokenizer_path, int vocab_size) {
     fclose(file);
 }
 
+void free_tokenizer(Tokenizer *t) {
+    for (int i = 0; i < t->vocab_size; i++) {
+        free(t->vocab[i]);
+    }
+    free(t->vocab);
+    free(t->vocab_scores);
+    if (t->sorted_vocab) free(t->sorted_vocab);
+}
+
 char *decode(Tokenizer *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return (char *)"[INVALID]";
     return t->vocab[token];
@@ -108,7 +123,10 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
 }
 
 void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
-    if (text == NULL) { std::cerr << "NULL text\n"; exit(1); }
+    if (text == NULL) { 
+        std::cerr << "NULL text" << std::endl;
+        exit(1); 
+    }
     
     if (t->sorted_vocab == NULL) {
         t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
@@ -141,7 +159,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         if (id != -1) {
             tokens[(*n_tokens)++] = id;
         } else {
-            for (int i = 0; i < str_len; i++)
+            for (size_t i = 0; i < str_len; i++)
                 tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
         }
         str_len = 0;
@@ -190,9 +208,9 @@ void softmax(float *x, int size) {
 }
 
 // ============================================================================
-// NEW: Read Checkpoint with Flattened Weights
+// Read Checkpoint with Flattened Weights
 // ============================================================================
-void read_checkpoint_flattened(std::string checkpoint, FlattenedWeights *weights) {
+void read_checkpoint(std::string checkpoint, Weights *weights) {
     FILE *file = fopen(checkpoint.c_str(), "rb");
     if (!file) { 
         fprintf(stderr, "Couldn't open %s\n", checkpoint.c_str()); 
@@ -228,13 +246,10 @@ void read_checkpoint_flattened(std::string checkpoint, FlattenedWeights *weights
     // Seek to start of weights
     fseek(file, header_size, SEEK_SET);
     
-    // Calculate sizes
-    const int kv_dim = (dim * n_kv_heads) / n_heads;
-    
-    // Allocate all weight arrays
-    weights->rms_att_weight = (float *)malloc(n_layers * dim * sizeof(float));
-    weights->rms_ffn_weight = (float *)malloc(n_layers * dim * sizeof(float));
-    weights->rms_final_weight = (float *)malloc(dim * sizeof(float));
+    // Allocate RMS norm weights
+    posix_memalign((void**)&weights->rms_att_weight, 4096, n_layers * dim * sizeof(float));
+    posix_memalign((void**)&weights->rms_ffn_weight, 4096, n_layers * dim * sizeof(float));
+    posix_memalign((void**)&weights->rms_final_weight, 4096, dim * sizeof(float));
     
     // Read RMS norm weights
     fread(weights->rms_att_weight, sizeof(float), n_layers * dim, file);
@@ -243,14 +258,16 @@ void read_checkpoint_flattened(std::string checkpoint, FlattenedWeights *weights
     
     // Token embedding - read quantized, then dequantize
     int emb_size = vocab_size * dim;
-    int8_t *q_emb = (int8_t *)malloc(emb_size * sizeof(int8_t));
-    float *s_emb = (float *)malloc((emb_size / GS) * sizeof(float));
+    int8_t *q_emb;
+    float *s_emb;
+    posix_memalign((void**)&q_emb, 4096, emb_size * sizeof(int8_t));
+    posix_memalign((void**)&s_emb, 4096, (emb_size / GS) * sizeof(float));
     
     fread(q_emb, sizeof(int8_t), emb_size, file);
     fread(s_emb, sizeof(float), emb_size / GS, file);
     
     // Dequantize embedding for host
-    weights->token_embedding_table = (float *)malloc(emb_size * sizeof(float));
+    posix_memalign((void**)&weights->token_embedding_table, 4096, emb_size * sizeof(float));
     for (int i = 0; i < emb_size; i++) {
         weights->token_embedding_table[i] = q_emb[i] * s_emb[i / GS];
     }
@@ -259,14 +276,14 @@ void read_checkpoint_flattened(std::string checkpoint, FlattenedWeights *weights
     int att_size = n_layers * dim * dim;
     int att_scale_size = att_size / GS;
     
-    weights->wq_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
-    weights->wq_scales = (float *)malloc(att_scale_size * sizeof(float));
-    weights->wk_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
-    weights->wk_scales = (float *)malloc(att_scale_size * sizeof(float));
-    weights->wv_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
-    weights->wv_scales = (float *)malloc(att_scale_size * sizeof(float));
-    weights->wo_weights = (int8_t *)malloc(att_size * sizeof(int8_t));
-    weights->wo_scales = (float *)malloc(att_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->wq_weights, 4096, att_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->wq_scales, 4096, att_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->wk_weights, 4096, att_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->wk_scales, 4096, att_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->wv_weights, 4096, att_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->wv_scales, 4096, att_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->wo_weights, 4096, att_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->wo_scales, 4096, att_scale_size * sizeof(float));
     
     // Read attention weights
     for (int l = 0; l < n_layers; l++) {
@@ -296,12 +313,12 @@ void read_checkpoint_flattened(std::string checkpoint, FlattenedWeights *weights
     int ffn2_size = n_layers * hidden_dim * dim;
     int ffn2_scale_size = ffn2_size / GS;
     
-    weights->w1_weights = (int8_t *)malloc(ffn1_size * sizeof(int8_t));
-    weights->w1_scales = (float *)malloc(ffn1_scale_size * sizeof(float));
-    weights->w2_weights = (int8_t *)malloc(ffn2_size * sizeof(int8_t));
-    weights->w2_scales = (float *)malloc(ffn2_scale_size * sizeof(float));
-    weights->w3_weights = (int8_t *)malloc(ffn1_size * sizeof(int8_t));
-    weights->w3_scales = (float *)malloc(ffn1_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->w1_weights, 4096, ffn1_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->w1_scales, 4096, ffn1_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->w2_weights, 4096, ffn2_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->w2_scales, 4096, ffn2_scale_size * sizeof(float));
+    posix_memalign((void**)&weights->w3_weights, 4096, ffn1_size * sizeof(int8_t));
+    posix_memalign((void**)&weights->w3_scales, 4096, ffn1_scale_size * sizeof(float));
     
     // Read FFN weights
     for (int l = 0; l < n_layers; l++) {
@@ -325,31 +342,72 @@ void read_checkpoint_flattened(std::string checkpoint, FlattenedWeights *weights
     int cls_scale_size = cls_size / GS;
     
     if (!shared_classifier) {
-        weights->wcls_weights = (int8_t *)malloc(cls_size * sizeof(int8_t));
-        weights->wcls_scales = (float *)malloc(cls_scale_size * sizeof(float));
+        posix_memalign((void**)&weights->wcls_weights, 4096, cls_size * sizeof(int8_t));
+        posix_memalign((void**)&weights->wcls_scales, 4096, cls_scale_size * sizeof(float));
         
         fread(weights->wcls_weights, sizeof(int8_t), cls_size, file);
         fread(weights->wcls_scales, sizeof(float), cls_scale_size, file);
+        
+        weights->cls_is_shared = false;
+        
+        // Free temporary embedding quantized data
+        free(q_emb);
+        free(s_emb);
     } else {
-        // Reuse token embedding weights
-        weights->wcls_weights = q_emb;  // Keep quantized version
+        // Reuse token embedding weights (keep quantized version)
+        weights->wcls_weights = q_emb;
         weights->wcls_scales = s_emb;
+        weights->cls_is_shared = true;
     }
     
     fclose(file);
 }
 
+void free_weights(Weights *weights) {
+    free(weights->token_embedding_table);
+    
+    free(weights->wq_weights);
+    free(weights->wq_scales);
+    free(weights->wk_weights);
+    free(weights->wk_scales);
+    free(weights->wv_weights);
+    free(weights->wv_scales);
+    free(weights->wo_weights);
+    free(weights->wo_scales);
+    
+    free(weights->w1_weights);
+    free(weights->w1_scales);
+    free(weights->w2_weights);
+    free(weights->w2_scales);
+    free(weights->w3_weights);
+    free(weights->w3_scales);
+    
+    free(weights->rms_att_weight);
+    free(weights->rms_ffn_weight);
+    free(weights->rms_final_weight);
+    
+    // Only free classifier if not shared
+    if (!weights->cls_is_shared) {
+        free(weights->wcls_weights);
+        free(weights->wcls_scales);
+    } else {
+        // If shared, these point to embedding data which we need to free
+        free(weights->wcls_weights);  // This is q_emb
+        free(weights->wcls_scales);   // This is s_emb
+    }
+}
+
 // ============================================================================
-// MAIN FUNCTION - Updated for Flattened Interface
+// MAIN FUNCTION
 // ============================================================================
 int main() {
     // Load weights with flattened structure
-    FlattenedWeights weights;
-    read_checkpoint_flattened("model.bin", &weights);
+    Weights weights;
+    read_checkpoint("/home/ehe12/HLSTranform/code/testbench/weights.bin", &weights);
     
     // Build tokenizer
     Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, "tokenizer.bin", vocab_size);
+    build_tokenizer(&tokenizer, "/home/ehe12/HLSTranform/code/testbench/tokenizer.bin", vocab_size);
     
     // Encode prompt
     const char *prompt = (char *)"I am happy";
@@ -363,7 +421,7 @@ int main() {
     float *value_cache = (float *)calloc(n_layers * seq_len * kv_dim, sizeof(float));
     float *logits = (float *)calloc(vocab_size, sizeof(float));
     
-    // CRITICAL: Check allocations
+    // Check allocations
     if (!key_cache || !value_cache || !logits || !prompt_tokens) {
         std::cerr << "Memory allocation failed!" << std::endl;
         return 1;
@@ -376,10 +434,10 @@ int main() {
     int steps = 15;
     
     std::cout << "Input: " << prompt << std::endl;
-    std::cout << "Output: " << std::endl;
+    std::cout << "Output: ";
     
     for (int i = 0; i < steps; i++) {
-        // === NEW: Call forward with flattened interface (24 arguments) ===
+        // Call forward with flattened interface
         forward(
             // Embedding
             weights.token_embedding_table,
@@ -434,7 +492,9 @@ int main() {
         char *piece = decode(&tokenizer, token, next);
         if (next == 2) break;  // End of sequence
         
-        std::cout << piece << std::endl;
+        std::cout << piece;
+        std::cout.flush();
+        
         token = next;
         pos++;
     }
@@ -442,24 +502,12 @@ int main() {
     std::cout << std::endl;
     
     // Cleanup
-    free(weights.token_embedding_table);
-    free(weights.wq_weights); free(weights.wq_scales);
-    free(weights.wk_weights); free(weights.wk_scales);
-    free(weights.wv_weights); free(weights.wv_scales);
-    free(weights.wo_weights); free(weights.wo_scales);
-    free(weights.w1_weights); free(weights.w1_scales);
-    free(weights.w2_weights); free(weights.w2_scales);
-    free(weights.w3_weights); free(weights.w3_scales);
-    free(weights.rms_att_weight);
-    free(weights.rms_ffn_weight);
-    free(weights.rms_final_weight);
-    free(weights.wcls_weights); free(weights.wcls_scales);
-    
+    free_weights(&weights);
+    free_tokenizer(&tokenizer);
     free(prompt_tokens);
     free(key_cache);
     free(value_cache);
     free(logits);
     
-    // CRITICAL: Return 0 for successful co-simulation
     return 0;
 }

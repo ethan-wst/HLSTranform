@@ -1,8 +1,14 @@
 #pragma once
+#ifndef CONFIG_H
+#define CONFIG_H
+
 #include "typedefs.h"
 
-
-// These values must match the checkpoint file being loaded.
+//===========================================================================
+// config.h
+//===========================================================================
+// @brief: Configuration parameters for Llama 2 model
+//         These values must match the checkpoint file being loaded.
 
 static constexpr int dim = 768;
 static constexpr int hidden_dim = 2048;
@@ -26,3 +32,5 @@ constexpr Config config = {
     .seq_len = seq_len,
     .GS = GS,
 };
+
+#endif // CONFIG_H
