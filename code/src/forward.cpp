@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cmath>
 #include <hls_math.h>
+#include <ap_int.h>
+#include <hls_stream.h>
 
 // Top-level forward function with flattened weight interface
 // All weights passed as individual pointers mapped to separate HBM banks
@@ -319,7 +321,6 @@ extern "C" void forward(
         swi_glu:
         for (int i = 0; i < hidden_dim; i++) {
             #pragma HLS PIPELINE II=1
-            #pragma HLS PIPELINE II=1
             #pragma HLS UNROLL factor=4
             #pragma HLS LOOP_TRIPCOUNT min=2048 max=2048
 
@@ -345,9 +346,9 @@ extern "C" void forward(
 
     // ==================== FINAL LAYER ======================
 
-    rmsnorm<dim>(x, x, rms_final_weight);
+    rmsnorm<dim>(xb, x, rms_final_weight);
 
     // Classifier
-    quantize<dim>(xq, xq_s, x);
+    quantize<dim>(xq, xq_s, xb);
     matmul<vocab_size, dim>(out, xq, xq_s, wcls_weights, wcls_scales);
 }

@@ -117,6 +117,26 @@ typedef struct {
     std::vector<int> story_token_counts;
 } BenchmarkEval;
 
+struct FPGAContext {
+    xrt::device device;
+    xrt::uuid uuid;
+    xrt::kernel kernel;
+    
+    FPGAContext() {}
+    
+    bool load(const std::string& xclbin_path) {
+        try {
+            device = xrt::device(0);
+            uuid = device.load_xclbin(xclbin_path);
+            kernel = xrt::kernel(device, uuid, "forward");
+            return true;
+        } catch (const std::exception& e) {
+            fprintf(stderr, "FPGA init error: %s\n", e.what());
+            return false;
+        }
+    }
+};
+
 // Bundle for device buffer objects
 struct DeviceBOs {
     xrt::bo emb_bo;
@@ -181,55 +201,46 @@ DeviceBOs prepare_device_bos(xrt::device& device, xrt::kernel& kernel, Weights* 
                   ffn2_size, ffn2_scale_bytes,
                   cls_size, cls_scale_bytes, cache_dim, out_bytes);
 
-    // Write weights (order must match kernel arg mapping)
-    bos.emb_bo.write(weights->token_embedding_table, emb_bytes, 0); 
+    bos.emb_bo.write(weights->token_embedding_table, emb_bytes, 0);
+    bos.wq_bo.write(weights->wq_weights, att_size, 0);
+    bos.wq_s_bo.write(weights->wq_scales, att_scale_bytes, 0);
+    bos.wk_bo.write(weights->wk_weights, att_size, 0);
+    bos.wk_s_bo.write(weights->wk_scales, att_scale_bytes, 0);
+    bos.wv_bo.write(weights->wv_weights, att_size, 0);
+    bos.wv_s_bo.write(weights->wv_scales, att_scale_bytes, 0);
+    bos.wo_bo.write(weights->wo_weights, att_size, 0);
+    bos.wo_s_bo.write(weights->wo_scales, att_scale_bytes, 0);
+    bos.w1_bo.write(weights->w1_weights, ffn1_size, 0);
+    bos.w1_s_bo.write(weights->w1_scales, ffn1_scale_bytes, 0);
+    bos.w2_bo.write(weights->w2_weights, ffn2_size, 0);
+    bos.w2_s_bo.write(weights->w2_scales, ffn2_scale_bytes, 0);
+    bos.w3_bo.write(weights->w3_weights, ffn1_size, 0);
+    bos.w3_s_bo.write(weights->w3_scales, ffn1_scale_bytes, 0);
+    bos.rms_att_bo.write(weights->rms_att_weight, n_layers * dim * sizeof(float), 0);
+    bos.rms_ffn_bo.write(weights->rms_ffn_weight, n_layers * dim * sizeof(float), 0);
+    bos.rms_final_bo.write(weights->rms_final_weight, dim * sizeof(float), 0);
+    bos.wcls_bo.write(weights->wcls_weights, cls_size, 0);
+    bos.wcls_s_bo.write(weights->wcls_scales, cls_scale_bytes, 0);
+
     bos.emb_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.wq_bo.write(weights->wq_weights, att_size, 0); 
     bos.wq_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.wq_s_bo.write(weights->wq_scales, att_scale_bytes, 0); 
     bos.wq_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.wk_bo.write(weights->wk_weights, att_size, 0); 
     bos.wk_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.wk_s_bo.write(weights->wk_scales, att_scale_bytes, 0); 
     bos.wk_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.wv_bo.write(weights->wv_weights, att_size, 0); 
     bos.wv_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.wv_s_bo.write(weights->wv_scales, att_scale_bytes, 0); 
     bos.wv_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.wo_bo.write(weights->wo_weights, att_size, 0); 
     bos.wo_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.wo_s_bo.write(weights->wo_scales, att_scale_bytes, 0); 
     bos.wo_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.w1_bo.write(weights->w1_weights, ffn1_size, 0); 
     bos.w1_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.w1_s_bo.write(weights->w1_scales, ffn1_scale_bytes, 0); 
     bos.w1_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.w2_bo.write(weights->w2_weights, ffn2_size, 0); 
     bos.w2_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.w2_s_bo.write(weights->w2_scales, ffn2_scale_bytes, 0); 
     bos.w2_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.w3_bo.write(weights->w3_weights, ffn1_size, 0); 
     bos.w3_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.w3_s_bo.write(weights->w3_scales, ffn1_scale_bytes, 0); 
     bos.w3_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.rms_att_bo.write(weights->rms_att_weight, n_layers * dim * sizeof(float), 0); 
     bos.rms_att_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.rms_ffn_bo.write(weights->rms_ffn_weight, n_layers * dim * sizeof(float), 0); 
     bos.rms_ffn_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.rms_final_bo.write(weights->rms_final_weight, dim * sizeof(float), 0); 
     bos.rms_final_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    
-    bos.wcls_bo.write(weights->wcls_weights, cls_size, 0); 
     bos.wcls_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    bos.wcls_s_bo.write(weights->wcls_scales, cls_scale_bytes, 0); 
     bos.wcls_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // Zero key/value cache
@@ -701,7 +712,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         int best_idx = -1;
 
         for (int i = 0; i < (*n_tokens - 1); i++) { 
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+            snprintf(str_buffer, t->max_token_length * 2 + 1 + 2, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
             int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
             
             if (id != -1 && t->vocab_scores[id] > best_score) {
@@ -809,69 +820,31 @@ float calculate_final_perplexity(const BenchmarkEval* eval) {
 /*-----------------------------------------------------------------------------------------*/
 // Generation Loop
 
-void generate(Weights *weights, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, std::string &kernelpath) {
+void generate(Weights *weights, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, FPGAContext& fpga) {
     const char *empty_prompt = "";
     if (prompt == NULL) prompt = (char*)empty_prompt;
 
     int num_prompt_tokens = 0;
-    int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
+    // Allocate sufficient buffer for BPE encoding (tokens can exceed character count)
+    int safe_capacity = std::max((int)strlen(prompt) * 2 + 16, seq_len + 4);
+    int *prompt_tokens = (int *)malloc(safe_capacity * sizeof(int));
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1) { 
         fprintf(stderr, "expected >=1 prompt token\n"); 
         exit(1); 
     }
-
-    auto device = xrt::device(0);
-    auto uuid = device.load_xclbin(kernelpath);
-    auto kernel = xrt::kernel(device, uuid, "forward");
-
-    DeviceBOs bos = prepare_device_bos(device, kernel, weights);
-
-    // First call
-    int token = prompt_tokens[0];
-    int pos = 0;
-    auto run = kernel(
-        bos.emb_bo,
-        bos.wq_bo, bos.wq_s_bo,
-        bos.wk_bo, bos.wk_s_bo,
-        bos.wv_bo, bos.wv_s_bo,
-        bos.wo_bo, bos.wo_s_bo,
-        bos.w1_bo, bos.w1_s_bo,
-        bos.w2_bo, bos.w2_s_bo,
-        bos.w3_bo, bos.w3_s_bo,
-        bos.rms_att_bo,
-        bos.rms_ffn_bo,
-        bos.rms_final_bo,
-        bos.wcls_bo, bos.wcls_s_bo,
-        bos.key_bo,
-        bos.value_bo,
-        bos.out_bo,
-        token,
-        pos
-    );
-    run.wait();
-
-    std::vector<float> logits(vocab_size);
-    bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
-
-    int next;
-    if (pos < num_prompt_tokens - 1) {
-        next = prompt_tokens[pos + 1];
-    } else {
-        next = sample(sampler, logits.data());
+    if (num_prompt_tokens > safe_capacity) {
+        fprintf(stderr, "Warning: encode produced %d tokens but buffer capacity was %d; clamping\n",
+                num_prompt_tokens, safe_capacity);
+        num_prompt_tokens = safe_capacity;
     }
-    
-    pos++;
-    char *piece = decode(tokenizer, token, next);
-    safe_printf(piece);
-    fflush(stdout);
-    token = next;
+    {
+        DeviceBOs bos = prepare_device_bos(fpga.device, fpga.kernel, weights);
 
-    // Generation loop
-    long start = time_in_ms();
-    while (pos < steps) {
-        auto run2 = kernel(
+        // First call
+        int token = prompt_tokens[0];
+        int pos = 0;
+        auto run = fpga.kernel(
             bos.emb_bo,
             bos.wq_bo, bos.wq_s_bo,
             bos.wk_bo, bos.wk_s_bo,
@@ -890,11 +863,13 @@ void generate(Weights *weights, Tokenizer *tokenizer, Sampler *sampler, char *pr
             token,
             pos
         );
-        run2.wait();
-        
+        run.wait();
+
+        std::vector<float> logits(vocab_size);
         bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
 
+        int next;
         if (pos < num_prompt_tokens - 1) {
             next = prompt_tokens[pos + 1];
         } else {
@@ -902,14 +877,53 @@ void generate(Weights *weights, Tokenizer *tokenizer, Sampler *sampler, char *pr
         }
         
         pos++;
-        if (next == 1) break;
-        
-        char *piece2 = decode(tokenizer, token, next);
-        safe_printf(piece2); 
+        char *piece = decode(tokenizer, token, next);
+        safe_printf(piece);
         fflush(stdout);
         token = next;
+
+        // Generation loop
+        while (pos < steps) {
+            auto run2 = fpga.kernel(
+                bos.emb_bo,
+                bos.wq_bo, bos.wq_s_bo,
+                bos.wk_bo, bos.wk_s_bo,
+                bos.wv_bo, bos.wv_s_bo,
+                bos.wo_bo, bos.wo_s_bo,
+                bos.w1_bo, bos.w1_s_bo,
+                bos.w2_bo, bos.w2_s_bo,
+                bos.w3_bo, bos.w3_s_bo,
+                bos.rms_att_bo,
+                bos.rms_ffn_bo,
+                bos.rms_final_bo,
+                bos.wcls_bo, bos.wcls_s_bo,
+                bos.key_bo,
+                bos.value_bo,
+                bos.out_bo,
+                token,
+                pos
+            );
+            run2.wait();
+            
+            bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
+
+            if (pos < num_prompt_tokens - 1) {
+                next = prompt_tokens[pos + 1];
+            } else {
+                next = sample(sampler, logits.data());
+            }
+            
+            pos++;
+            if (next == 2) break;
+            
+            char *piece2 = decode(tokenizer, token, next);
+            safe_printf(piece2); 
+            fflush(stdout);
+            token = next;
+        }
+        printf("\n");
     }
-    printf("\n");
 
     free(prompt_tokens);
 }
@@ -917,21 +931,11 @@ void generate(Weights *weights, Tokenizer *tokenizer, Sampler *sampler, char *pr
 /*-----------------------------------------------------------------------------------------*/
 // Evaluation Loop
 
-void evaluate(const std::string& text_file,
-              Weights *weights,
-              Tokenizer *tokenizer,
-              const std::string &kernelpath,
-              int max_stories = 25) {
-    // FPGA setup
-    auto device = xrt::device(0);
-    auto uuid = device.load_xclbin(kernelpath);
-    auto kernel = xrt::kernel(device, uuid, "forward");
-
-    DeviceBOs bos = prepare_device_bos(device, kernel, weights);
-
-    const size_t cache_dim = (size_t)n_layers * seq_len * kv_dim;
-    std::vector<float> zero_cache(cache_dim, 0.0f);
-
+void evaluate(const std::string& text_file, Weights *weights, Tokenizer *tokenizer, FPGAContext& fpga, int max_stories = 25) {
+    printf("=== Starting Evaluation ===\n");
+    printf("Text file: %s\n", text_file.c_str());
+    printf("Max stories: %d\n\n", max_stories);
+    
     FILE *file = fopen(text_file.c_str(), "r");
     if (!file) {
         fprintf(stderr, "Error: cannot open %s\n", text_file.c_str());
@@ -949,174 +953,210 @@ void evaluate(const std::string& text_file,
     eval.total_inference_calls = 0;
 
     int stories_processed = 0;
-    char line[4096];
-    std::string current_story;
     long overall_start = time_in_ms();
-
-    std::vector<float> logits(vocab_size);
+    long overall_end = 0;
     
-    auto first_words = [](const std::string &s, int max_words, int max_chars) {
-        std::string out;
-        int words = 0;
-        for (size_t i = 0; i < s.size() && (int)out.size() < max_chars; ++i) {
-            char c = s[i];
-            out.push_back(c);
-            if (c == ' ' || c == '\n' || c == '\t') {
-                if (i + 1 < s.size() && s[i+1] != ' ' && s[i+1] != '\n' && s[i+1] != '\t') {
-                    ++words;
-                    if (words >= max_words) break;
+    {
+        printf("Preparing device buffers...\n");
+        DeviceBOs bos = prepare_device_bos(fpga.device, fpga.kernel, weights);
+        printf("Device buffers ready.\n\n");
+
+        const size_t cache_dim = (size_t)n_layers * seq_len * kv_dim;
+        std::vector<float> zero_cache(cache_dim, 0.0f);
+
+        char line[4096];
+        std::string current_story;
+
+        std::vector<float> logits(vocab_size);
+        
+        auto first_words = [](const std::string &s, int max_words, int max_chars) {
+            std::string out;
+            int words = 0;
+            for (size_t i = 0; i < s.size() && (int)out.size() < max_chars; ++i) {
+                char c = s[i];
+                out.push_back(c);
+                if (c == ' ' || c == '\n' || c == '\t') {
+                    if (i + 1 < s.size() && s[i+1] != ' ' && s[i+1] != '\n' && s[i+1] != '\t') {
+                        ++words;
+                        if (words >= max_words) break;
+                    }
                 }
             }
-        }
-        while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
-        if (out.size() > 0 && (int)out.size() > max_chars) out.resize(max_chars);
-        return out;
-    };
+            while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
+            if (out.size() > 0 && (int)out.size() > max_chars) out.resize(max_chars);
+            return out;
+        };
 
-    while (fgets(line, sizeof(line), file)) {
-        if (max_stories > 0 && stories_processed >= max_stories) break;
-        line[strcspn(line, "\n")] = 0;
-        if (strlen(line) == 0) continue;
+        while (fgets(line, sizeof(line), file)) {
+            if (max_stories > 0 && stories_processed >= max_stories) break;
+            line[strcspn(line, "\n")] = 0;
+            if (strlen(line) == 0) continue;
 
-        if (strcmp(line, "<|endoftext|>") == 0) {
-            if (current_story.empty()) continue;
+            if (strcmp(line, "<|endoftext|>") == 0) {
+                if (current_story.empty()) continue;
 
-            // Tokenize story
-            int num_tokens = 0;
-            int safe_capacity = std::max((int)current_story.length() * 2 + 16, seq_len + 4);
-            std::vector<int> tokens_buf(safe_capacity);
-            char *dup = strdup(current_story.c_str());
-            encode(tokenizer, dup, 1, 0, tokens_buf.data(), &num_tokens);
-            free(dup);
-            
-            if (num_tokens > safe_capacity) {
-                fprintf(stderr, "Warning: encode produced %d tokens but buffer capacity was %d; clamping\n",
-                        num_tokens, safe_capacity);
-                num_tokens = safe_capacity;
-            }
-            if (num_tokens < 2) { 
-                current_story.clear(); 
-                continue; 
-            }
+                printf("Processing story %d...\n", stories_processed + 1);
+                
+                // Tokenize story
+                int num_tokens = 0;
+                int safe_capacity = std::max((int)current_story.length() * 2 + 16, seq_len + 4);
+                std::vector<int> tokens_buf(safe_capacity);
+                char *dup = strdup(current_story.c_str());
+                long tokenize_start = time_in_ms();
+                encode(tokenizer, dup, 1, 0, tokens_buf.data(), &num_tokens);
+                long tokenize_time = time_in_ms() - tokenize_start;
+                free(dup);
+                printf("  Tokenized: %d tokens in %ld ms\n", num_tokens, tokenize_time);
+                
+                if (num_tokens > safe_capacity) {
+                    fprintf(stderr, "Warning: encode produced %d tokens but buffer capacity was %d; clamping\n",
+                            num_tokens, safe_capacity);
+                    num_tokens = safe_capacity;
+                }
+                if (num_tokens < 2) { 
+                    current_story.clear(); 
+                    continue; 
+                }
 
-            // Clear device KV cache for this story
-            bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
-            bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
-            bos.value_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                // Clear device KV cache for this story
+                printf("  Clearing KV cache...\n");
+                bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
+                bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
+                bos.value_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            double story_logprob_sum = 0.0;
-            int story_token_count = 0;
-            long story_total_infer_ms = 0;
-            long story_first_token_ms = 0;
+                double story_logprob_sum = 0.0;
+                int story_token_count = 0;
+                long story_total_infer_ms = 0;
+                long story_first_token_ms = 0;
 
-            std::string preview = first_words(current_story, 6, 120);
+                std::string preview = first_words(current_story, 6, 120);
 
-            // Per-token inference loop
-            for (int local_pos = 0; local_pos < num_tokens - 1; ++local_pos) {
-                if (local_pos >= seq_len) {
-                    fprintf(stderr, "Warning: story %d has > seq_len (%d) tokens; truncating at %d\n",
-                            stories_processed + 1, seq_len, seq_len);
-                    break;
+                printf("  Running inference for %d tokens...\n", num_tokens - 1);
+                long inference_start = time_in_ms();
+                
+                // Per-token inference loop
+                for (int local_pos = 0; local_pos < num_tokens - 1; ++local_pos) {
+                    if (local_pos >= seq_len) {
+                        fprintf(stderr, "Warning: story %d has > seq_len (%d) tokens; truncating at %d\n",
+                                stories_processed + 1, seq_len, seq_len);
+                        break;
+                    }
+                    
+                    int current_token = tokens_buf[local_pos];
+                    int target_token = tokens_buf[local_pos + 1];
+                    
+                    if (target_token < 0 || target_token >= vocab_size) {
+                        fprintf(stderr, "Warning: invalid target token id %d (story %d pos %d). Skipping.\n",
+                                target_token, stories_processed + 1, local_pos);
+                        continue;
+                    }
+
+                    long inf_start = time_in_ms();
+
+                    auto run = fpga.kernel(
+                        bos.emb_bo,
+                        bos.wq_bo, bos.wq_s_bo,
+                        bos.wk_bo, bos.wk_s_bo,
+                        bos.wv_bo, bos.wv_s_bo,
+                        bos.wo_bo, bos.wo_s_bo,
+                        bos.w1_bo, bos.w1_s_bo,
+                        bos.w2_bo, bos.w2_s_bo,
+                        bos.w3_bo, bos.w3_s_bo,
+                        bos.rms_att_bo,
+                        bos.rms_ffn_bo,
+                        bos.rms_final_bo,
+                        bos.wcls_bo, bos.wcls_s_bo,
+                        bos.key_bo,
+                        bos.value_bo,
+                        bos.out_bo,
+                        current_token,
+                        local_pos
+                    );
+                    run.wait();
+
+                    long inf_end = time_in_ms();
+                    long inf_time = inf_end - inf_start;
+                    if (local_pos == 0) story_first_token_ms = inf_time;
+                    story_total_infer_ms += inf_time;
+
+                    bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
+
+                    float lp = compute_log_prob(logits.data(), target_token, vocab_size);
+                    story_logprob_sum += lp;
+                    story_token_count++;
                 }
                 
-                int current_token = tokens_buf[local_pos];
-                int target_token = tokens_buf[local_pos + 1];
-                
-                if (target_token < 0 || target_token >= vocab_size) {
-                    fprintf(stderr, "Warning: invalid target token id %d (story %d pos %d). Skipping.\n",
-                            target_token, stories_processed + 1, local_pos);
-                    continue;
+                long inference_end = time_in_ms();
+                long total_inference_time = inference_end - inference_start;
+                printf("  Inference completed: %d tokens in %ld ms (%.2f ms/token)\n", 
+                       story_token_count, total_inference_time, 
+                       story_token_count > 0 ? (float)total_inference_time / story_token_count : 0.0f);
+
+                // Compute per-story metrics
+                float story_perplexity = -1.0f;
+                if (story_token_count > 0) {
+                    float avg_nll = - (float)(story_logprob_sum / story_token_count);
+                    story_perplexity = expf(avg_nll);
                 }
+                float story_throughput = (story_total_infer_ms > 0 && story_token_count > 0) ?
+                                        (story_token_count / (float)story_total_infer_ms * 1000.0f) : 0.0f;
 
-                long inf_start = time_in_ms();
+                // Update running eval
+                eval.total_log_prob += (float)story_logprob_sum;
+                eval.total_tokens += story_token_count;
+                eval.total_inference_time_ms += story_total_infer_ms;
+                eval.total_first_token_time_ms += story_first_token_ms;
+                eval.total_stories++;
+                eval.total_inference_calls += story_token_count;
+                if (story_throughput > 0.0f) eval.story_throughputs.push_back(story_throughput);
+                eval.story_first_token_latencies.push_back(story_first_token_ms);
+                eval.story_token_counts.push_back(story_token_count);
 
-                auto run = kernel(
-                    bos.emb_bo,
-                    bos.wq_bo, bos.wq_s_bo,
-                    bos.wk_bo, bos.wk_s_bo,
-                    bos.wv_bo, bos.wv_s_bo,
-                    bos.wo_bo, bos.wo_s_bo,
-                    bos.w1_bo, bos.w1_s_bo,
-                    bos.w2_bo, bos.w2_s_bo,
-                    bos.w3_bo, bos.w3_s_bo,
-                    bos.rms_att_bo,
-                    bos.rms_ffn_bo,
-                    bos.rms_final_bo,
-                    bos.wcls_bo, bos.wcls_s_bo,
-                    bos.key_bo,
-                    bos.value_bo,
-                    bos.out_bo,
-                    current_token,
-                    local_pos
-                );
-                run.wait();
+                // Running metrics
+                float running_perplexity = calculate_final_perplexity(&eval);
+                float running_throughput = (eval.total_inference_time_ms > 0) ?
+                                        (eval.total_tokens / (float)eval.total_inference_time_ms * 1000.0f) : 0.0f;
 
-                long inf_end = time_in_ms();
-                long inf_time = inf_end - inf_start;
-                if (local_pos == 0) story_first_token_ms = inf_time;
-                story_total_infer_ms += inf_time;
+                // Print per-story report
+                printf("Story %d: preview=\"%s\"\n", stories_processed + 1, preview.c_str());
+                printf("  tokens=%d  perplexity=%.4f  throughput=%.2f tok/s  first_token=%ld ms\n",
+                    story_token_count, story_perplexity, story_throughput, story_first_token_ms);
+                printf("  running: stories=%d  tokens=%d  perplexity=%.4f  throughput=%.2f tok/s\n\n",
+                    eval.total_stories, eval.total_tokens, running_perplexity, running_throughput);
 
-                bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
-
-                float lp = compute_log_prob(logits.data(), target_token, vocab_size);
-                story_logprob_sum += lp;
-                story_token_count++;
+                stories_processed++;
+                current_story.clear();
+            } else {
+                if (!current_story.empty()) current_story += " ";
+                current_story += line;
             }
-
-            // Compute per-story metrics
-            float story_perplexity = -1.0f;
-            if (story_token_count > 0) {
-                float avg_nll = - (float)(story_logprob_sum / story_token_count);
-                story_perplexity = expf(avg_nll);
-            }
-            float story_throughput = (story_total_infer_ms > 0 && story_token_count > 0) ?
-                                     (story_token_count / (float)story_total_infer_ms * 1000.0f) : 0.0f;
-
-            // Update running eval
-            eval.total_log_prob += (float)story_logprob_sum;
-            eval.total_tokens += story_token_count;
-            eval.total_inference_time_ms += story_total_infer_ms;
-            eval.total_first_token_time_ms += story_first_token_ms;
-            eval.total_stories++;
-            eval.total_inference_calls += story_token_count;
-            if (story_throughput > 0.0f) eval.story_throughputs.push_back(story_throughput);
-            eval.story_first_token_latencies.push_back(story_first_token_ms);
-            eval.story_token_counts.push_back(story_token_count);
-
-            // Running metrics
-            float running_perplexity = calculate_final_perplexity(&eval);
-            float running_throughput = (eval.total_inference_time_ms > 0) ?
-                                       (eval.total_tokens / (float)eval.total_inference_time_ms * 1000.0f) : 0.0f;
-
-            // Print per-story report
-            printf("Story %d: preview=\"%s\"\n", stories_processed + 1, preview.c_str());
-            printf("  tokens=%d  perplexity=%.4f  throughput=%.2f tok/s  first_token=%ld ms\n",
-                   story_token_count, story_perplexity, story_throughput, story_first_token_ms);
-            printf("  running: stories=%d  tokens=%d  perplexity=%.4f  throughput=%.2f tok/s\n\n",
-                   eval.total_stories, eval.total_tokens, running_perplexity, running_throughput);
-
-            stories_processed++;
-            current_story.clear();
-        } else {
-            if (!current_story.empty()) current_story += " ";
-            current_story += line;
         }
+
+        overall_end = time_in_ms();
     }
-
-    long overall_end = time_in_ms();
     fclose(file);
+    
+    long total_elapsed = overall_end - overall_start;
 
-    fprintf(stderr, "Processed %d stories in %ld ms\n", stories_processed, overall_end - overall_start);
+    printf("\n=== Evaluation Complete ===\n");
+    printf("Total elapsed time: %ld ms (%.2f seconds)\n", total_elapsed, total_elapsed / 1000.0f);
+    printf("Stories processed: %d\n\n", stories_processed);
 
     // Print final summary
     float final_perplexity = calculate_final_perplexity(&eval);
     float overall_throughput = (eval.total_inference_time_ms > 0) ?
                                (eval.total_tokens / (float)eval.total_inference_time_ms * 1000.0f) : 0.0f;
-    fprintf(stderr, "FINAL: stories=%d tokens=%d perplexity=%.4f throughput=%.2f tok/s avg_first_token_ms=%.2f\n",
-            eval.total_stories, eval.total_tokens, final_perplexity, overall_throughput,
-            (eval.total_stories > 0) ? (eval.total_first_token_time_ms / (double)eval.total_stories) : 0.0);
+    
+    printf("=== Final Metrics ===\n");
+    printf("Stories: %d\n", eval.total_stories);
+    printf("Total tokens: %d\n", eval.total_tokens);
+    printf("Perplexity: %.4f\n", final_perplexity);
+    printf("Throughput: %.2f tok/s\n", overall_throughput);
+    printf("Avg first token latency: %.2f ms\n",
+           (eval.total_stories > 0) ? (eval.total_first_token_time_ms / (double)eval.total_stories) : 0.0);
+    printf("Total inference time: %ld ms\n", eval.total_inference_time_ms);
 }
 
 /*-----------------------------------------------------------------------------------------*/
@@ -1162,6 +1202,12 @@ int main(int argc, char *argv[]) {
     if (temperature < 0.0f) temperature = 0.0f;
     if (topp < 0.0f || topp > 1.0f) topp = 0.9f;
 
+    FPGAContext fpga;
+    if (!fpga.load(kernelpath)) {
+        fprintf(stderr, "Failed to initialize FPGA\n");
+        return 1;
+    }
+
     // Load weights
     Weights weights;
     read_checkpoint(checkpoint_path, &weights);
@@ -1178,9 +1224,9 @@ int main(int argc, char *argv[]) {
 
     // Run mode
     if (mode == "generate") {
-        generate(&weights, &tokenizer, &sampler, prompt, steps, kernelpath);
+        generate(&weights, &tokenizer, &sampler, prompt, steps, fpga);
     } else if (mode == "evaluate") {
-        evaluate(eval_file, &weights, &tokenizer, kernelpath);  
+        evaluate(eval_file, &weights, &tokenizer, fpga);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode.c_str());
         error_usage();

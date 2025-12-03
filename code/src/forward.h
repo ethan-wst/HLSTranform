@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <hls_math.h>
 #include <ap_int.h>
+#include <hls_stream.h>
+#include <stdint.h>
 
 
 
@@ -27,7 +29,9 @@
 //   - Independent bandwidth optimization per weight type
 //   - Proper depth specification for each m_axi interface
 
-#define ACC_COUNT 4
+typedef ap_uint<128> wide_int8_t;
+#define PACK_SIZE 16
+#define UNROLL_FACTOR 8
 
 extern "C" void forward(
     // Embedding Weights
@@ -66,45 +70,65 @@ extern "C" void forward(
     int pos
 );
 
-#define UNROLL_FACTOR 8
-
 template<int D, int N>
 void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
     #pragma HLS INLINE off
-    
-    const int NUM_GROUPS = N / GS;
+
+    wide_int8_t *wq_wide = (wide_int8_t *)wq;
 
     output_loop: 
-    for (int row = 0; row < D; row++) {
+    for (int i = 0; i < D; i++) {
         
-        float output_accum = 0.0f;
-        
-        group_loop: 
-        for (int g = 0; g < NUM_GROUPS; g++) {
-            
-            int group_start = g * GS;
-            int32_t group_acc = 0;
-            
-            dot_loop: 
-            for (int k = 0; k < GS; k++) {
-                #pragma HLS PIPELINE II=1
-                #pragma HLS UNROLL factor=UNROLL_FACTOR
-                
-                int idx = group_start + k;
-                
-                int32_t prod = ((int32_t)xq[idx]) * ((int32_t)wq[idx]);
-                group_acc += prod;
-            }
-            
-            float dequant = ((float)group_acc) * ws[g] * xs[g];
-            output_accum += dequant;
+        float acc[8];
+        #pragma HLS ARRAY_PARTITION variable=acc complete
+        for(int j = 0; j < 8; j++) {
+            acc[j] = 0.0f;
         }
         
-        xout[row] = output_accum;
+        inner_loop: 
+        for (int j = 0; j < N; j+=GS) {
+        #pragma HLS PIPELINE II=1
+
+            float partial_sum = 0.0f;
+
+            chunk_loop:
+            for (int chunk = 0; chunk < GS; chunk += PACK_SIZE) {
+                #pragma HLS UNROLL
+
+                int global_j = j + chunk;
+                int wide_idx = (i * N + global_j) / PACK_SIZE;
+                wide_int8_t w_chunk = wq_wide[wide_idx];
+            
+                int32_t dot_acc = 0;
+
+                dot_loop: 
+                for (int k = 0; k < PACK_SIZE; k++) {
+                    #pragma HLS UNROLL
+
+                    int8_t w_val = (int8_t)w_chunk.range(8*k + 7, 8*k);
+                    int8_t x_val = xq[global_j + k];
+                
+                    
+                    int32_t prod = ((int32_t)x_val) * ((int32_t)w_val);
+                    dot_acc += prod;
+                }
+                
+                float dequant = ((float)dot_acc) * ws[i * N /GS + global_j / GS] * xs[global_j / GS];
+                partial_sum += dequant;
+            }
+            acc[(j / GS) % 8] += partial_sum;
+        }
+
+        accumulate:
+        float output_acc = 0.0f;
+        for(int j = 0; j < 4; j++) {
+             output_acc += acc[j];
+        }
+
+        xout[i] = output_acc;
     }
 }
 
-// TODO: Look into find_max/exp_sum reduction and loop-carried dependency optimizations
 template<int MAXSIZE>
 void softmax(float *x, int size) {
     #pragma HLS INLINE off
@@ -187,11 +211,9 @@ void quantize(int8_t qx_q[S], float qx_s[S/GS], float x[S]) {
     for (int group = 0; group < num_groups; group++) {
         #pragma HLS LOOP_TRIPCOUNT min=12 max=32
 
-        
         // Find max absolute value in group
         float wmax = 0.0f;
         int base_idx = group * GS;
-
 
         find_max:
         for (int i = 0; i < GS; i++) {

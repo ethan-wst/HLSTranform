@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 
 // ============================================================================
 // Tokenizer Structures
@@ -112,7 +113,16 @@ void free_tokenizer(Tokenizer *t) {
 
 char *decode(Tokenizer *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return (char *)"[INVALID]";
-    return t->vocab[token];
+    char *piece = t->vocab[token];
+    // Following BOS (1) token, sentencepiece decoder strips any leading whitespace
+    if (prev_token == 1 && piece[0] == ' ') piece++;
+
+    unsigned char byte_val;
+    // If this is a raw byte token, map it to the corresponding byte piece
+    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+        piece = (char *)t->byte_pieces + byte_val * 2;
+    }
+    return piece;
 }
 
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
@@ -170,7 +180,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         int best_id = -1, best_idx = -1;
         
         for (int i = 0; i < (*n_tokens - 1); i++) {
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
+            snprintf(str_buffer, t->max_token_length * 2 + 1 + 2, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
             int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
             
             if (id != -1 && t->vocab_scores[id] > best_score) {
@@ -386,15 +396,9 @@ void free_weights(Weights *weights) {
     free(weights->rms_ffn_weight);
     free(weights->rms_final_weight);
     
-    // Only free classifier if not shared
-    if (!weights->cls_is_shared) {
-        free(weights->wcls_weights);
-        free(weights->wcls_scales);
-    } else {
-        // If shared, these point to embedding data which we need to free
-        free(weights->wcls_weights);  // This is q_emb
-        free(weights->wcls_scales);   // This is s_emb
-    }
+    // Free classifier (handling shared case)
+    free(weights->wcls_weights);
+    free(weights->wcls_scales);
 }
 
 // ============================================================================
@@ -411,9 +415,16 @@ int main() {
     
     // Encode prompt
     const char *prompt = (char *)"I am happy";
-    int *prompt_tokens = (int *)malloc(seq_len * sizeof(int));
+    int safe_capacity = std::max((int)strlen(prompt) * 2 + 16, seq_len + 4);
+    int *prompt_tokens = (int *)malloc(safe_capacity * sizeof(int));
     int num_prompt_tokens = 0;
     encode(&tokenizer, (char *)prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    
+    if (num_prompt_tokens > safe_capacity) {
+        std::cerr << "Warning: encode produced " << num_prompt_tokens 
+                  << " tokens but buffer capacity was " << safe_capacity << "; clamping" << std::endl;
+        num_prompt_tokens = safe_capacity;
+    }
     
     // Allocate caches
     constexpr int kv_dim = (dim * n_kv_heads) / n_heads;
