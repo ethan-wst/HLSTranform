@@ -243,8 +243,10 @@ DeviceBOs prepare_device_bos(xrt::device& device, xrt::kernel& kernel, Weights* 
     bos.wcls_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bos.wcls_s_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    // Zero key/value cache
+    // Zero key/value cache (initial state)
+    // Note: This will be re-zeroed in evaluate() before first story for determinism
     std::vector<float> zero_cache(cache_dim, 0.0f);
+    std::fill(zero_cache.begin(), zero_cache.end(), 0.0f);
     bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
     bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
@@ -959,15 +961,22 @@ void evaluate(const std::string& text_file, Weights *weights, Tokenizer *tokeniz
     {
         printf("Preparing device buffers...\n");
         DeviceBOs bos = prepare_device_bos(fpga.device, fpga.kernel, weights);
-        printf("Device buffers ready.\n\n");
-
+        
         const size_t cache_dim = (size_t)n_layers * seq_len * kv_dim;
         std::vector<float> zero_cache(cache_dim, 0.0f);
+        
+        // Ensure KV cache is zeroed before any inference
+        printf("Initializing KV cache...\n");
+        bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
+        bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
+        bos.value_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        printf("Device buffers ready.\n\n");
 
         char line[4096];
         std::string current_story;
 
-        std::vector<float> logits(vocab_size);
+        std::vector<float> logits(vocab_size, 0.0f);
         
         auto first_words = [](const std::string &s, int max_words, int max_chars) {
             std::string out;
@@ -1018,8 +1027,10 @@ void evaluate(const std::string& text_file, Weights *weights, Tokenizer *tokeniz
                     continue; 
                 }
 
-                // Clear device KV cache for this story
+                // Clear device KV cache for this story (critical for deterministic results)
                 printf("  Clearing KV cache...\n");
+                // Force synchronous clear to ensure previous story data is completely flushed
+                std::fill(zero_cache.begin(), zero_cache.end(), 0.0f);
                 bos.key_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
                 bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 bos.value_bo.write(zero_cache.data(), cache_dim * sizeof(float), 0); 
@@ -1080,7 +1091,20 @@ void evaluate(const std::string& text_file, Weights *weights, Tokenizer *tokeniz
                     if (local_pos == 0) story_first_token_ms = inf_time;
                     story_total_infer_ms += inf_time;
 
+                    // Synchronize ALL modified buffers from device
+                    // Key/value cache is modified by kernel and must be synced for next iteration
+                    bos.key_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    bos.value_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    
+                    // Force cache coherency by syncing back to device
+                    // This ensures writes from previous kernel are visible to next kernel
+                    bos.key_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    bos.value_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    
                     bos.out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    
+                    // Zero buffer before read to ensure no stale data
+                    std::fill(logits.begin(), logits.end(), 0.0f);
                     bos.out_bo.read(logits.data(), vocab_size * sizeof(float), 0);
 
                     float lp = compute_log_prob(logits.data(), target_token, vocab_size);

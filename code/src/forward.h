@@ -29,8 +29,9 @@
 //   - Independent bandwidth optimization per weight type
 //   - Proper depth specification for each m_axi interface
 
-typedef ap_uint<128> wide_int8_t;
-#define PACK_SIZE 16
+typedef ap_uint<512> wide_int8_t;
+typedef ap_uint<256> wide_ws_t;
+#define PACK_SIZE 64
 #define UNROLL_FACTOR 8
 
 extern "C" void forward(
@@ -79,9 +80,10 @@ void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
     output_loop: 
     for (int i = 0; i < D; i++) {
         
-        float acc[8];
+        float acc[UNROLL_FACTOR];
         #pragma HLS ARRAY_PARTITION variable=acc complete
-        for(int j = 0; j < 8; j++) {
+        acc_init:
+        for(int j = 0; j < UNROLL_FACTOR; j++) {
             acc[j] = 0.0f;
         }
         
@@ -105,29 +107,29 @@ void matmul(float *xout, int8_t *xq, float *xs, int8_t *wq, float *ws) {
                 for (int k = 0; k < PACK_SIZE; k++) {
                     #pragma HLS UNROLL
 
-                    int8_t w_val = (int8_t)w_chunk.range(8*k + 7, 8*k);
-                    int8_t x_val = xq[global_j + k];
-                
-                    
-                    int32_t prod = ((int32_t)x_val) * ((int32_t)w_val);
+                    int32_t prod = ((int32_t)xq[global_j + k]) * ((int32_t)((int8_t)w_chunk.range(8*k + 7, 8*k)));
                     dot_acc += prod;
                 }
                 
                 float dequant = ((float)dot_acc) * ws[i * N /GS + global_j / GS] * xs[global_j / GS];
                 partial_sum += dequant;
             }
-            acc[(j / GS) % 8] += partial_sum;
+            acc[(j / GS) % UNROLL_FACTOR] += partial_sum;
         }
 
-        accumulate:
-        float output_acc = 0.0f;
-        for(int j = 0; j < 4; j++) {
-             output_acc += acc[j];
-        }
+        float output_acc;
+        float sum0 = acc[0] + acc[1];
+        float sum1 = acc[2] + acc[3];
+        float sum2 = acc[4] + acc[5];
+        float sum3 = acc[6] + acc[7];
+        float sum_lo = sum0 + sum1;
+        float sum_hi = sum2 + sum3;
+        output_acc = sum_lo + sum_hi;
 
         xout[i] = output_acc;
     }
 }
+
 
 template<int MAXSIZE>
 void softmax(float *x, int size) {
