@@ -1,64 +1,120 @@
+#pragma once
+#ifndef FORWARD_H
+#define FORWARD_H
+
 #include "typedefs.h"
 #include "config.h"
-#include <math.h>
+#include <cmath>
 #include <cstring>
+#include <cstdint>
 
-extern "C" void forward(Transformer<dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, GS> *transformer, int token, int pos, float key_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], float value_cache[n_layers * seq_len * ((dim * n_kv_heads) / n_heads)], float *out);
-template <int S>
-void dequantize(QuantizedTensor<S> *qx, float x[S], int GS)
-{
-  for (int i = 0; i < S; i++)
-  {
-    x[i] = qx->q[i] * qx->s[i / GS];
-  }
+//===========================================================================
+// forward.h
+//===========================================================================
+// @brief: Forward pass function declaration for Llama 2 transformer
+//         with FLATTENED INTERFACE for optimal HBM access
+
+// ============================================================================
+// TOP-LEVEL FORWARD FUNCTION
+// ============================================================================
+// All weight arrays are passed individually, allowing each to be mapped to 
+// separate HBM banks. This design enables:
+//   - Parallel weight access across up to 23 HBM banks
+//   - Optimal burst patterns for sequential array access
+//   - Independent bandwidth optimization per weight type
+//   - Proper depth specification for each m_axi interface
+
+extern "C" void forward(
+    // Embedding Weights
+    float *token_embedding_table,     // [vocab_size * dim] - bundle=gmem0
+    
+    // Attention Weights (all layers concatenated)
+    int8_t *wq_weights,               // [n_layers * dim * dim] - bundle=gmem1
+    float *wq_scales,                 // [n_layers * dim * dim / GS] - bundle=gmem2
+    int8_t *wk_weights,               // [n_layers * dim * kv_dim] - bundle=gmem3
+    float *wk_scales,                 // [n_layers * dim * kv_dim / GS] - bundle=gmem4
+    int8_t *wv_weights,               // [n_layers * dim * kv_dim] - bundle=gmem5
+    float *wv_scales,                 // [n_layers * dim * kv_dim / GS] - bundle=gmem6
+    int8_t *wo_weights,               // [n_layers * dim * dim] - bundle=gmem7
+    float *wo_scales,                 // [n_layers * dim * dim / GS] - bundle=gmem8
+    
+    // FFN Weights (all layers concatenated)
+    int8_t *w1_weights,               // [n_layers * dim * hidden_dim] - bundle=gmem9
+    float *w1_scales,                 // [n_layers * dim * hidden_dim / GS] - bundle=gmem10
+    int8_t *w2_weights,               // [n_layers * hidden_dim * dim] - bundle=gmem11
+    float *w2_scales,                 // [n_layers * hidden_dim * dim / GS] - bundle=gmem12
+    int8_t *w3_weights,               // [n_layers * dim * hidden_dim] - bundle=gmem13
+    float *w3_scales,                 // [n_layers * dim * hidden_dim / GS] - bundle=gmem14
+    
+    // RMS Normalization Weights
+    float *rms_att_weight,            // [n_layers * dim] - bundle=gmem15
+    float *rms_ffn_weight,            // [n_layers * dim] - bundle=gmem16
+    float *rms_final_weight,          // [dim] - bundle=gmem17
+    
+    // Classifier Weights
+    int8_t *wcls_weights,             // [vocab_size * dim] - bundle=gmem18
+    float *wcls_scales,               // [vocab_size * dim / GS] - bundle=gmem19
+    
+    // KV Cache (all layers)
+    float *key_cache,                 // [n_layers * seq_len * kv_dim] - bundle=gmem20
+    float *value_cache,               // [n_layers * seq_len * kv_dim] - bundle=gmem21
+    
+    // Output
+    float *out,                       // [vocab_size] - bundle=gmem22
+    
+    // Control Parameters
+    int token,                        // Current input token ID
+    int pos                          // Position in sequence
+);
+
+// ============================================================================
+// HELPER FUNCTIONS FOR QUANTIZATION
+// ============================================================================
+// These are used by the host code and HLS implementation
+
+// Dequantize a quantized tensor into float array
+template<int S>
+void dequantize(QuantizedTensor<S> *qx, float x[S], int GS) {
+    for (int i = 0; i < S; i++) {
+        x[i] = qx->q[i] * qx->s[i / GS];
+    }
 }
 
-template <int S>
-void quantize(QuantizedTensor<S> *qx, float x[S], int GS)
-{
-  constexpr int num_groups = S / 64;
-  constexpr float Q_MAX = 127.0f;
-  float scale_buffer[num_groups];
-  int8_t quantized_buffer[S];
-// #pragma HLS ARRAY_PARTITION variable = x type=cyclic factor = 8
-// #pragma HLS ARRAY_PARTITION variable = quantized_buffer type = cyclic factor = 64
-// #pragma HLS ARRAY_PARTITION variable = scale_buffer type = cyclic factor = 16
-
-main_loop:
-  for (int group = 0; group < num_groups; group++)
-  {
-// #pragma HLS UNROLL factor = 8
-// #pragma HLS PIPELINE
-    float wmax = 0.0;
-    int base_idx = group * GS;
-
-  // Calculate the max absolute value in the current group
-  max:
-    for (int i = 0; i < GS; i++)
-    {
-// #pragma HLS PIPELINE
-      float val = fabs(x[base_idx + i]);
-      if (val > wmax)
-      {
-        wmax = val;
-      }
+// Quantize float array into separate quantized values and scales
+template<int S>
+void quantize(int8_t qx_q[S], float qx_s[S/GS], float x[S]) {
+    #pragma HLS INLINE off
+    
+    constexpr int num_groups = S / GS;
+    constexpr float inv_Q_MAX = 1.0f / 127.0f;
+    
+    main_loop:
+    for (int group = 0; group < num_groups; group++) {
+        #pragma HLS PIPELINE II=1
+        #pragma HLS LOOP_TRIPCOUNT min=12 max=32
+        
+        // Find max absolute value in group
+        float wmax = 0.0f;
+        find_max:
+        for (int i = 0; i < GS; i++) {
+            #pragma HLS UNROLL factor=16 skip_exit_check
+            float val = std::abs(x[group * GS + i]);
+            if (val > wmax) wmax = val;
+        }
+        
+        // Calculate scale and quantize
+        float scale = wmax * inv_Q_MAX;
+        qx_s[group] = scale;
+        
+        float inv_scale = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
+        
+        quantize_group:
+        for (int i = 0; i < GS; i++) {
+            #pragma HLS UNROLL factor=16 skip_exit_check
+            float quant_val = x[group * GS + i] * inv_scale;
+            qx_q[group * GS + i] = (int8_t)quant_val;
+        }
     }
-
-    // Calculate and write the scaling factor
-    float scale = wmax / Q_MAX;
-    scale_buffer[group] = scale;
-
-    // Calculate and write the quantized values
-    for (int i = 0; i < GS; i++)
-    {
-// #pragma HLS UNROLL factor=8 skip_exit_check
-// #pragma HLS PIPELINE
-      float quant_value = x[base_idx + i] / scale;   // scale
-      int8_t quantized = (int8_t)round(quant_value); // round and clamp
-      quantized_buffer[base_idx + i] = quantized;
-    }
-  }
-
-  std::memcpy(qx->q, quantized_buffer, S * sizeof(int8_t));
-  std::memcpy(qx->s, scale_buffer, num_groups * sizeof(float));
 }
+
+#endif // FORWARD_H

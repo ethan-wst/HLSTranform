@@ -4,11 +4,19 @@ HLS_*
 base*
 deploy/*
 .ipcache
+*link*/
+*synth*/
 
 # Ignore binary files
 *.bin
-*.xclbin
+*.xclbin*
 *.xo
+*.log
+*.out
 
 # Compile outputs
 _x/
+*.sh 
+vscode
+Xil
+
